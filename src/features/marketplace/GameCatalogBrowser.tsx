@@ -1,0 +1,12 @@
+import { ChevronRight,FolderTree } from "lucide-react"
+import { categoryTitleFor,type CatalogCategory,type CatalogNode } from "../../models/catalog"
+const hasKind=(node:CatalogNode,kind:string):boolean=>node.category.gameKind===kind||node.children.some(child=>hasKind(child,kind))
+const leaves=(node:CatalogNode,kind:string):CatalogCategory[]=>[...(node.category.gameKind===kind?[node.category]:[]),...node.children.flatMap(child=>leaves(child,kind))]
+export function firstGameLeaf(tree:CatalogNode[],kind:string){for(const node of tree){const found=leaves(node,kind)[0];if(found)return found}return null}
+export function GameCatalogBrowser({tree,gameKind,locale,selectedCode,onSelect}:{tree:CatalogNode[];gameKind:string;locale:string;selectedCode:string;onSelect:(c:CatalogCategory)=>void}){
+ const roots=tree.filter(node=>hasKind(node,gameKind));if(!roots.length)return <section className="liquid-card p-5 text-[11px] text-muted">Game content is arriving with the beta.</section>
+ return <section className="liquid-card p-4 sm:p-5"><div className="mb-3 flex items-center gap-2"><FolderTree className="h-4 w-4 text-accent"/><div><p className="text-[9px] font-bold uppercase tracking-[.14em] text-muted">Game content</p><h2 className="text-[15px] font-extrabold text-ink">Choose a topic</h2></div></div><div className="space-y-2.5">{roots.map(root=><Branch key={root.category.id} node={root} kind={gameKind} locale={locale} selected={selectedCode} onSelect={onSelect}/>)}</div></section>
+}
+function Branch({node,kind,locale,selected,onSelect}:{node:CatalogNode;kind:string;locale:string;selected:string;onSelect:(c:CatalogCategory)=>void}){
+ const options=leaves(node,kind);return <div className="liquid-soft rounded-[16px] p-3"><div className="flex items-center gap-1.5 text-[11px] font-extrabold text-ink">{categoryTitleFor(node.category,locale)}<ChevronRight className="h-3 w-3 text-muted"/></div>{node.children.filter(child=>hasKind(child,kind)&&child.children.length>0).map(child=><p key={child.category.id} className="mt-2 text-[8px] font-bold uppercase tracking-wider text-muted">{categoryTitleFor(child.category,locale)}</p>)}<div className="mt-2 flex flex-wrap gap-1.5">{options.map(item=><button key={item.id} onClick={()=>onSelect(item)} className={`rounded-full px-3 py-2 text-[9px] font-bold ${selected===item.code?"bg-accent text-white shadow-glow":"bg-surfaceHi text-muted hover:text-ink"}`}>{categoryTitleFor(item,locale)}</button>)}</div></div>
+}

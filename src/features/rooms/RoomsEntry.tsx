@@ -1,0 +1,13 @@
+import { Hash,Plus,UsersRound } from "lucide-react"
+import { useState } from "react"
+import { useNavigate } from "react-router-dom"
+import { Routes } from "../../app/routes"
+import { roomsApi } from "../../api/roomsApi"
+import { KeyraButton } from "../../ui/KeyraButton"
+export function RoomsEntry({compact=false}:{compact?:boolean}){
+ const navigate=useNavigate(),[busy,setBusy]=useState(false),[joining,setJoining]=useState(false),[code,setCode]=useState(""),[error,setError]=useState<string|null>(null)
+ const go=(v:string)=>navigate(`${Routes.room}/${v}`)
+ const create=async()=>{setBusy(true);setError(null);try{const s=await roomsApi.create({gameSlug:"math-rush",kind:"math",subjectCode:"math_arith",exerciseId:0,level:2,mode:"duo",maxPlayers:2,timeLimitSec:120,hostPlays:true});if(s.room.id)go(s.room.code);else setError("Could not create a room.")}catch{setError("Could not create a room.")}finally{setBusy(false)}}
+ const join=async()=>{const clean=code.trim().toUpperCase();if(!clean)return;setBusy(true);setError(null);try{const s=await roomsApi.join(clean);if(s.room.id)go(s.room.code);else setError("Room not found.")}catch{setError("Could not join that room.")}finally{setBusy(false)}}
+ return <section className={`liquid-card ${compact?"p-3.5 sm:p-4":"p-4 sm:p-5"}`}><div className="grid gap-3 sm:grid-cols-[1fr_auto] sm:items-center"><div className="flex items-start gap-3"><span className="glass-key grid h-10 w-10 shrink-0 place-items-center rounded-[13px] text-accent"><UsersRound className="h-4 w-4"/></span><div><p className="text-[9px] font-bold uppercase tracking-[.14em] text-muted">Live rooms</p><h2 className="text-[15px] font-extrabold tracking-ios text-ink">Play with friends</h2><p className="mt-0.5 text-[9px] text-muted">Quick Math Rush duel or join any game by code.</p></div></div><div className="flex gap-2"><KeyraButton label="Quick duel" icon={<Plus className="h-3.5 w-3.5"/>} loading={busy&&!joining} onClick={create}/>{joining?<div className="liquid-control flex min-w-0 flex-1 items-center rounded-[14px] p-1 pl-3"><input autoFocus value={code} onChange={e=>setCode(e.target.value.toUpperCase())} onKeyDown={e=>e.key==="Enter"&&void join()} placeholder="ABC123" className="min-w-0 flex-1 bg-transparent text-[11px] font-bold tracking-widest outline-none"/><button onClick={()=>void join()} className="rounded-[10px] bg-surface px-3 py-2 text-[10px] font-bold text-accent">Join</button></div>:<KeyraButton label="Join code" kind="ghost" icon={<Hash className="h-3.5 w-3.5"/>} onClick={()=>setJoining(true)}/>}</div></div>{error&&<p className="mt-2 text-[9px] font-medium text-danger">{error}</p>}</section>
+}

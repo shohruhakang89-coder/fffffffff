@@ -1,0 +1,86 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root, html[data-theme="light"] {
+  color-scheme: light;
+  --keyra-bg: #fafafa;
+  --keyra-bg-rgb: 250 250 250;
+  --keyra-surface: #ffffff;
+  --keyra-surface-rgb: 255 255 255;
+  --keyra-surface-hi: #f4f5f7;
+  --keyra-surface-hi-rgb: 244 245 247;
+  --keyra-surface-mid-rgb: 238 241 245;
+  --keyra-accent: #007aff;
+  --keyra-accent-rgb: 0 122 255;
+  --keyra-accent-soft: #e3f0ff;
+  --keyra-accent-soft-rgb: 227 240 255;
+  --keyra-mint-rgb: 48 194 98;
+  --keyra-amber-rgb: 244 143 24;
+  --keyra-danger-rgb: 255 59 48;
+  --keyra-text: #171719;
+  --keyra-text-rgb: 23 23 25;
+  --keyra-text-muted: #6e7786;
+  --keyra-text-muted-rgb: 110 119 134;
+  --keyra-line-rgb: 218 223 231;
+  --keyra-glass-border-rgb: 255 255 255;
+  --keyra-shadow-glow: 0 12px 30px -14px rgba(0,122,255,.5);
+  --keyra-shadow-card: 0 1px 2px rgba(20,34,54,.04), 0 16px 42px -26px rgba(31,57,92,.22);
+  --keyra-shadow-float: 0 2px 5px rgba(22,39,62,.05), 0 30px 70px -34px rgba(31,57,92,.32);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --keyra-bg: #050914;
+  --keyra-bg-rgb: 5 9 20;
+  --keyra-surface: #0b1423;
+  --keyra-surface-rgb: 11 20 35;
+  --keyra-surface-hi: #111e31;
+  --keyra-surface-hi-rgb: 17 30 49;
+  --keyra-surface-mid-rgb: 24 40 63;
+  --keyra-accent: #3a82ff;
+  --keyra-accent-rgb: 58 130 255;
+  --keyra-accent-soft: #173765;
+  --keyra-accent-soft-rgb: 23 55 101;
+  --keyra-mint-rgb: 47 210 126;
+  --keyra-amber-rgb: 255 186 45;
+  --keyra-danger-rgb: 255 84 89;
+  --keyra-text: #f7f8fc;
+  --keyra-text-rgb: 247 248 252;
+  --keyra-text-muted: #98a6ba;
+  --keyra-text-muted-rgb: 152 166 186;
+  --keyra-line-rgb: 40 57 82;
+  --keyra-glass-border-rgb: 129 168 226;
+  --keyra-shadow-glow: 0 16px 38px -14px rgba(45,121,255,.65);
+  --keyra-shadow-card: 0 1px 1px rgba(255,255,255,.03), 0 24px 58px -30px rgba(0,0,0,.72);
+  --keyra-shadow-float: 0 34px 82px -34px rgba(0,0,0,.88);
+}
+
+@layer base {
+  html, body, #root { min-height: 100%; }
+  * { box-sizing: border-box; }
+  html { background: var(--keyra-bg); }
+  body { margin: 0; min-width: 320px; overflow-x: hidden; background: var(--keyra-bg); color: var(--keyra-text); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", Inter, system-ui, sans-serif; letter-spacing: -.014em; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; transition: background 240ms ease, color 240ms ease; }
+  button, input, textarea { font: inherit; color: inherit; }
+  button { -webkit-tap-highlight-color: transparent; }
+  /* Text inputs live inside rounded glass containers that show focus via
+     :focus-within, so a bare rectangular outline on the transparent input
+     itself only produced a hard blue box. Keep a soft, rounded ring for
+     keyboard users on buttons; let the container handle input focus. */
+  button:focus-visible { outline: 2px solid rgb(var(--keyra-accent-rgb) / .5); outline-offset: 2px; border-radius: 12px; }
+  input:focus-visible, textarea:focus-visible { outline: none; }
+  ::selection { background: rgb(var(--keyra-accent-rgb) / .2); }
+}
+
+@layer utilities {
+  .font-mono-keyra { font-family: "SF Mono", ui-monospace, Menlo, monospace; }
+  .tracking-ios { letter-spacing: -.032em; }
+  .scroll-clean { scrollbar-width: none; }
+  .scroll-clean::-webkit-scrollbar { display: none; }
+  .page-enter { animation: page-in 420ms cubic-bezier(.2,.8,.2,1) both; }
+}
+@keyframes page-in { from { opacity: 0; transform: translateY(9px) scale(.995); } to { opacity: 1; transform: none; } }
+@keyframes material-float { 0%,100% { transform: translate3d(0,0,0) rotate(-1deg); } 50% { transform: translate3d(0,-7px,0) rotate(1deg); } }
+@keyframes message-in { from { opacity: 0; transform: translateY(5px) scale(.98); } to { opacity: 1; transform: none; } }
+@keyframes soft-pulse { 0%,100% { opacity: .55; } 50% { opacity: .9; } }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; } }
