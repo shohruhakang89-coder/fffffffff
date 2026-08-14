@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 520" fill="none">
+ <defs><linearGradient id="g" x1="110" y1="45" x2="520" y2="455"><stop stop-color="#fff" stop-opacity=".96"/><stop offset="1" stop-color="#BFD8FF" stop-opacity=".48"/></linearGradient><filter id="b"><feGaussianBlur stdDeviation="18"/></filter></defs>
+ <ellipse cx="330" cy="280" rx="220" ry="160" fill="#0A84FF" opacity=".12" filter="url(#b)"/>
+ <g stroke="url(#g)" stroke-width="2"><ellipse cx="320" cy="260" rx="205" ry="105" transform="rotate(-18 320 260)"/><ellipse cx="320" cy="260" rx="205" ry="105" transform="rotate(44 320 260)"/><circle cx="320" cy="260" r="126"/></g>
+ <g fill="url(#g)" stroke="#fff" stroke-opacity=".75"><rect x="255" y="195" width="130" height="130" rx="42"/><circle cx="151" cy="233" r="32"/><circle cx="468" cy="168" r="28"/><circle cx="460" cy="365" r="34"/></g>
+ <g fill="#126DDA" font-family="Arial" font-weight="700" text-anchor="middle"><text x="320" y="282" font-size="64">K</text><text x="151" y="244" font-size="28">+</text><text x="468" y="178" font-size="24">{ }</text><text x="460" y="376" font-size="31">?</text></g>
+ <g fill="#fff"><circle cx="223" cy="100" r="8"/><circle cx="512" cy="280" r="7"/><circle cx="188" cy="390" r="9"/></g>
+</svg>

@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 260" role="img" aria-labelledby="title">
+  <title id="title">Blue liquid glass trophy</title>
+  <defs>
+    <linearGradient id="cup" x1="102" y1="34" x2="248" y2="212" gradientUnits="userSpaceOnUse">
+      <stop stop-color="white" stop-opacity=".88"/>
+      <stop offset=".34" stop-color="#9AC6FF" stop-opacity=".58"/>
+      <stop offset=".7" stop-color="#377FFF" stop-opacity=".34"/>
+      <stop offset="1" stop-color="#0A2F78" stop-opacity=".62"/>
+    </linearGradient>
+    <linearGradient id="base" x1="122" y1="182" x2="243" y2="239" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#CBE2FF" stop-opacity=".78"/>
+      <stop offset="1" stop-color="#174EA9" stop-opacity=".55"/>
+    </linearGradient>
+    <radialGradient id="glow">
+      <stop stop-color="#4A8DFF" stop-opacity=".52"/>
+      <stop offset="1" stop-color="#1F66E8" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-50%" y="-40%" width="200%" height="210%">
+      <feDropShadow dx="0" dy="16" stdDeviation="14" flood-color="#0A63FF" flood-opacity=".35"/>
+    </filter>
+  </defs>
+  <ellipse cx="180" cy="224" rx="130" ry="34" fill="url(#glow)"/>
+  <g filter="url(#shadow)">
+    <path d="M102 46H258L245 116C237 157 214 177 180 177C146 177 123 157 115 116Z" fill="url(#cup)" stroke="white" stroke-opacity=".56" stroke-width="2"/>
+    <path d="M106 64H70V96C70 127 89 145 121 147" fill="none" stroke="url(#cup)" stroke-width="15" stroke-linecap="round"/>
+    <path d="M254 64H290V96C290 127 271 145 239 147" fill="none" stroke="url(#cup)" stroke-width="15" stroke-linecap="round"/>
+    <path d="M163 172H197V202H163Z" fill="url(#cup)" stroke="white" stroke-opacity=".4"/>
+    <path d="M128 200H232L249 230H111Z" fill="url(#base)" stroke="white" stroke-opacity=".48" stroke-width="2"/>
+    <path d="M120 61C153 41 205 40 242 57" fill="none" stroke="white" stroke-opacity=".68" stroke-width="8" stroke-linecap="round"/>
+    <path d="M133 78C143 126 156 145 181 151" fill="none" stroke="white" stroke-opacity=".36" stroke-width="7" stroke-linecap="round"/>
+  </g>
+  <circle cx="134" cy="66" r="7" fill="white" fill-opacity=".72"/>
+  <circle cx="236" cy="94" r="4" fill="#A9D2FF" fill-opacity=".8"/>
+</svg>
