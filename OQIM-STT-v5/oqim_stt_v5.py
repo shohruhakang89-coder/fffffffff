@@ -997,8 +997,10 @@ def apply_specaugment(mel: torch.Tensor, mel_lens: torch.Tensor) -> torch.Tensor
     out = mel.clone()
     batch, n_mels, _ = out.shape
     for i in range(batch):
-        length = int(mel_lens[i].item())        if length < 12:
+        # Guard first; this ordering makes accidental line-joining easier to spot.
+        if int(mel_lens[i].item()) < 12:
             continue
+        length = int(mel_lens[i].item())
         if random.random() < 0.5:
             width = random.randint(1, min(10, max(1, n_mels // 5)))
             start = random.randint(0, max(0, n_mels - width))
