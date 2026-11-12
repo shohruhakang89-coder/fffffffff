@@ -1531,5 +1531,7 @@ def main():
                                   checkpoint_path=args.checkpoint, resume=not args.no_resume)
 
 
-if __name__ == "__main__":
+# Jupyter/Kaggle/Colab injects kernel-file arguments into sys.argv.
+# Do not auto-run the CLI when this file is executed/imported in a notebook.
+if __name__ == "__main__" and "ipykernel" not in sys.modules:
     main()
