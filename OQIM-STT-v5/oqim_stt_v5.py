@@ -1514,7 +1514,15 @@ def transcribe_file_streaming(audio_path: str, output_txt: Optional[str] = None,
 # =============================================================================
 
 
-def main():
+def main(argv=None):
+    # A notebook kernel adds its own JSON connection file to sys.argv.
+    # If main() is called from a notebook, never parse those kernel arguments.
+    if argv is None and ("ipykernel" in sys.modules or "google.colab" in sys.modules):
+        print("[OQIM] Notebook muhiti aniqlandi. CLI ishga tushirilmadi.")
+        print("[OQIM] Trening uchun alohida katakda train() ni chaqiring.")
+        print("[OQIM] Audio uchun transcribe_file_streaming(AUDIO_PATH) ni chaqiring.")
+        return
+
     parser = argparse.ArgumentParser(description="OQIM-STT v5.0")
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("train")
@@ -1523,15 +1531,20 @@ def main():
     p_inf.add_argument("--output", default=None)
     p_inf.add_argument("--checkpoint", default=None)
     p_inf.add_argument("--no-resume", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
     if args.cmd == "train":
         train()
     elif args.cmd == "transcribe":
-        transcribe_file_streaming(args.audio, output_txt=args.output,
-                                  checkpoint_path=args.checkpoint, resume=not args.no_resume)
+        transcribe_file_streaming(
+            args.audio,
+            output_txt=args.output,
+            checkpoint_path=args.checkpoint,
+            resume=not args.no_resume,
+        )
 
 
 # Jupyter/Kaggle/Colab injects kernel-file arguments into sys.argv.
 # Do not auto-run the CLI when this file is executed/imported in a notebook.
-if __name__ == "__main__" and "ipykernel" not in sys.modules:
+if __name__ == "__main__" and "ipykernel" not in sys.modules and "google.colab" not in sys.modules:
     main()
