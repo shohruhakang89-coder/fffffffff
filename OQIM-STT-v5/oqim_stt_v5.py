@@ -1013,11 +1013,21 @@ def apply_specaugment(mel: torch.Tensor, mel_lens: torch.Tensor) -> torch.Tensor
 
 
 def train():
+    print("[OQIM] TRAINING BOSHLANDI — konfiguratsiya va dataset tekshirilmoqda...", flush=True)
     if not HF_TOKEN:
-        raise RuntimeError("HF_TOKEN yo'q. Avval eski ochiq tokenni revoke qiling, keyin yangi tokenni Secrets orqali kiriting.")
+        raise RuntimeError(
+            "HF_TOKEN topilmadi. Kaggle > Add-ons > Secrets bo'limida "
+            "HF_TOKEN nomli secret yarating va Hugging Face tokenini kiriting."
+        )
+    print(f"[OQIM] Dataset: {DATASET_REPO}", flush=True)
+    print(f"[OQIM] Model repo: {MODEL_REPO}", flush=True)
+    print(f"[OQIM] Device: {DEVICE} | batch={MAX_BATCH_EXAMPLES} | grad_accum={GRAD_ACCUM}", flush=True)
     api = HfApi(token=HF_TOKEN)
+    print("[OQIM] Dataset shardlari olinmoqda...", flush=True)
     shards = get_dataset_shards(api)
-    print(f"[OQIM] {len(shards)} ta Parquet shard topildi.")
+    if not shards:
+        raise RuntimeError(f"Dataset repo ichida Parquet shard topilmadi: {DATASET_REPO}")
+    print(f"[OQIM] {len(shards)} ta Parquet shard topildi.", flush=True)
 
     model = OqimSTTCTC().to(DEVICE)
     optimizer = torch.optim.AdamW(model.parameters(), lr=MAX_LR, weight_decay=WEIGHT_DECAY,
@@ -1544,7 +1554,17 @@ def main(argv=None):
         )
 
 
-# Jupyter/Kaggle/Colab injects kernel-file arguments into sys.argv.
-# Do not auto-run the CLI when this file is executed/imported in a notebook.
-if __name__ == "__main__" and "ipykernel" not in sys.modules and "google.colab" not in sys.modules:
-    main()
+# Entry point:
+# - Terminal: use python oqim_stt_v5.py train / transcribe ...
+# - Kaggle/Colab: executing this file starts training by default.
+#   Set OQIM_AUTO_TRAIN=0 to load definitions only.
+if __name__ == "__main__":
+    _in_notebook = "ipykernel" in sys.modules or "google.colab" in sys.modules
+    if _in_notebook:
+        _auto_train = os.getenv("OQIM_AUTO_TRAIN", "1").strip().lower()
+        if _auto_train not in ("0", "false", "no", "off"):
+            train()
+        else:
+            print("[OQIM] Faqat funksiyalar yuklandi. Trening uchun train() ni chaqiring.", flush=True)
+    else:
+        main()
