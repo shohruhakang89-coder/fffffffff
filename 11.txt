@@ -1,0 +1,1355 @@
+# ==============================================================================
+# 🛡️ UZ RUN v16.5 — FULL FIX (SINGLE CELL)
+# ==============================================================================
+import os, sys, time, json, math, socket, shutil, secrets, hashlib, hmac as pyhmac, zipfile, threading, subprocess, urllib.request, queue, re
+from pathlib import Path
+
+WORKDIR = Path("/kaggle/working")
+BUILD, SDK, VID, PHOT = WORKDIR/"b", WORKDIR/"sdk", WORKDIR/"v", WORKDIR/"p"
+PGDIR, PGBK = Path("/var/lib/postgresql/uzr"), WORKDIR/"uzr.sql"
+for d in (BUILD, SDK, VID, PHOT): d.mkdir(parents=True, exist_ok=True)
+
+print("⚙️ Tizim...")
+subprocess.run("apt-get update -qq && apt-get install -y -qq postgresql postgresql-contrib libpq-dev openjdk-17-jdk-headless unzip zip wget curl ffmpeg >/dev/null 2>&1", shell=True, check=False)
+subprocess.run([sys.executable,"-m","pip","install","-q","flask","waitress","psycopg2-binary","pillow"], check=False)
+
+from PIL import Image, ImageDraw
+import psycopg2
+from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
+from flask import Flask, request, jsonify, Response, send_file
+from waitress import serve
+
+def free_port(s):
+    for p in range(s, s+250):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+            if sk.connect_ex(("127.0.0.1", p)) != 0: return p
+    return s
+APP_PORT, PG_PORT = free_port(8050), 5433
+MK = WORKDIR/"mk.key"
+if not MK.exists(): MK.write_text(secrets.token_hex(32))
+SECRET = MK.read_text().strip()
+
+def stretch(pw, salt):
+    k = f"{salt}:{SECRET}".encode()
+    st = pyhmac.new(k, pw.encode(), hashlib.sha256).digest()
+    for r in range(4096):
+        st = pyhmac.new(k, st + r.to_bytes(4,"big"), hashlib.sha256).digest()
+    return st.hex()
+
+def sign_token(uid, uname, exp):
+    pay = f"{uid}.{uname}.{exp}"
+    sig = pyhmac.new(SECRET.encode(), pay.encode(), hashlib.sha256).hexdigest()
+    return f"{pay}.{sig}"
+
+def verify_token(tok):
+    p = tok.split(".")
+    if len(p) != 4: return None
+    pay = ".".join(p[:3])
+    exp = pyhmac.new(SECRET.encode(), pay.encode(), hashlib.sha256).hexdigest()
+    if not pyhmac.compare_digest(exp, p[3]): return None
+    try:
+        if int(p[2]) < time.time(): return None
+        return p[0]
+    except: return None
+
+def check_physics(uid, dist, dt, steps, acc, prov):
+    if prov not in ("gps","network","fused","web"): return False,"PROVIDER"
+    if acc > 80: return False,"LOW_ACC"
+    if dt <= 0.05: return False,"TIME"
+    sp = (dist/dt)*3.6
+    if sp > 28 and dist > 15: return False,f"CAR"
+    if sp > 60: return False,f"IMPOSSIBLE"
+    if dt > 8 and dist > 25: return False,"TELEPORT"
+    if dist > 15 and steps < 2 and dt < 20: return False,"NO_STEPS"
+    if dist > 8 and dt < 1: return False,"BURST"
+    return True,"OK"
+
+print("🐘 DB...")
+pgbins = sorted(Path("/usr/lib/postgresql").glob("*/bin"), reverse=True)
+PGBIN = str(pgbins[0]) if pgbins else "/usr/lib/postgresql/16/bin"
+subprocess.run(f"pkill -9 -f '{PGDIR}' || true", shell=True); time.sleep(0.3)
+if not (PGDIR/"PG_VERSION").exists():
+    PGDIR.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["chown","-R","postgres:postgres",str(PGDIR.parent)], check=True)
+    subprocess.run(["chmod","700",str(PGDIR)], check=True)
+    subprocess.run(["su","-","postgres","-c",f"{PGBIN}/initdb -D {PGDIR} --auth=trust --encoding=UTF8 --locale=C"], check=True, stdout=subprocess.DEVNULL)
+    (PGDIR/"pg_hba.conf").write_text("local all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\n")
+    with open(PGDIR/"postgresql.conf","a") as f:
+        f.write(f"\nlisten_addresses='127.0.0.1'\nport={PG_PORT}\nmax_connections=100\nshared_buffers=128MB\nfsync=off\nsynchronous_commit=off\n")
+subprocess.run(["chown","-R","postgres:postgres",str(PGDIR)], check=True)
+subprocess.run(["su","-","postgres","-c",f"{PGBIN}/pg_ctl -D {PGDIR} -l {PGDIR}/pg.log -w start"], check=True, stdout=subprocess.DEVNULL)
+for _ in range(30):
+    if subprocess.run([f"{PGBIN}/pg_isready","-h","127.0.0.1","-p",str(PG_PORT)], stdout=subprocess.DEVNULL).returncode==0: break
+    time.sleep(0.2)
+subprocess.run(f"{PGBIN}/psql -U postgres -h 127.0.0.1 -p {PG_PORT} -tc \"SELECT 1 FROM pg_database WHERE datname='uzr'\" | grep -q 1 || {PGBIN}/createdb -U postgres -h 127.0.0.1 -p {PG_PORT} uzr", shell=True, check=True)
+if PGBK.exists() and PGBK.stat().st_size > 200:
+    subprocess.run([f"{PGBIN}/psql","-U","postgres","-h","127.0.0.1","-p",str(PG_PORT),"-d","uzr","-f",str(PGBK)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+
+pool_ = pool.ThreadedConnectionPool(2, 32, host="127.0.0.1", port=PG_PORT, dbname="uzr", user="postgres")
+def db(sql, p=None, fetch=False):
+    c = pool_.getconn()
+    try:
+        with c:
+            with c.cursor(cursor_factory=RealDictCursor) as cur:
+                if p is not None: cur.execute(sql, p)
+                else: cur.execute(sql)
+                if fetch: return [dict(r) for r in cur.fetchall()]
+    finally: pool_.putconn(c)
+
+db("""CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(32) UNIQUE NOT NULL, pw_hash VARCHAR(128) NOT NULL, pw_salt VARCHAR(64) NOT NULL, color VARCHAR(16) NOT NULL, bio TEXT DEFAULT '', total_distance_m DOUBLE PRECISION DEFAULT 0, total_runs INTEGER DEFAULT 0, last_lon DOUBLE PRECISION DEFAULT 69.2401, last_lat DOUBLE PRECISION DEFAULT 41.2995, last_gps_ts DOUBLE PRECISION DEFAULT 0, created_at DOUBLE PRECISION NOT NULL)""")
+db("""CREATE TABLE IF NOT EXISTS sessions (token VARCHAR(256) PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at DOUBLE PRECISION NOT NULL)""")
+db("""CREATE TABLE IF NOT EXISTS active_trails (user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, coords_json TEXT NOT NULL, updated_at DOUBLE PRECISION NOT NULL)""")
+db("""CREATE TABLE IF NOT EXISTS runs (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, distance_m DOUBLE PRECISION NOT NULL, duration_sec DOUBLE PRECISION DEFAULT 0, steps INTEGER DEFAULT 0, created_at DOUBLE PRECISION NOT NULL)""")
+db("""CREATE TABLE IF NOT EXISTS posts (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, run_id INTEGER, caption TEXT DEFAULT '', video_path VARCHAR(255), video_status VARCHAR(16) DEFAULT 'pending', photo_path VARCHAR(255), distance_m DOUBLE PRECISION DEFAULT 0, duration_sec DOUBLE PRECISION DEFAULT 0, pace_sec_per_km DOUBLE PRECISION DEFAULT 0, likes_count INTEGER DEFAULT 0, comments_count INTEGER DEFAULT 0, created_at DOUBLE PRECISION NOT NULL)""")
+db("CREATE INDEX IF NOT EXISTS posts_created_idx ON posts(created_at DESC)")
+db("""CREATE TABLE IF NOT EXISTS comments (id SERIAL PRIMARY KEY, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT DEFAULT '', created_at DOUBLE PRECISION NOT NULL)""")
+db("""CREATE TABLE IF NOT EXISTS post_likes (post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at DOUBLE PRECISION NOT NULL, PRIMARY KEY (post_id, user_id))""")
+db("""CREATE TABLE IF NOT EXISTS chat_messages (id SERIAL PRIMARY KEY, from_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, to_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT DEFAULT '', photo_path VARCHAR(255), video_path VARCHAR(255), read_at DOUBLE PRECISION DEFAULT 0, created_at DOUBLE PRECISION NOT NULL)""")
+db("CREATE INDEX IF NOT EXISTS chat_idx ON chat_messages(from_id, to_id, created_at DESC)")
+db("""CREATE TABLE IF NOT EXISTS build_artifacts (platform VARCHAR(16) PRIMARY KEY, filename VARCHAR(128) NOT NULL, size_bytes BIGINT NOT NULL, sha256 VARCHAR(128) NOT NULL, status VARCHAR(32) NOT NULL, built_at DOUBLE PRECISION NOT NULL)""")
+
+def backup():
+    while True:
+        time.sleep(60)
+        try:
+            tmp = Path(f"{PGBK}.tmp")
+            r = subprocess.run([f"{PGBIN}/pg_dump","-U","postgres","-h","127.0.0.1","-p",str(PG_PORT),"--clean","--if-exists","-f",str(tmp),"uzr"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if r.returncode==0 and tmp.exists(): os.replace(tmp, PGBK)
+        except: pass
+threading.Thread(target=backup, daemon=True).start()
+print("   ✅ DB")
+
+def hav(lon1, lat1, lon2, lat2):
+    R=6371000; p1=math.radians(lat1); p2=math.radians(lat2)
+    a=math.sin((p2-p1)/2)**2+math.cos(p1)*math.cos(p2)*math.sin(math.radians(lon2-lon1)/2)**2
+    return 2*R*math.asin(math.sqrt(min(1.0,a)))
+
+def trail_dist(trail):
+    return sum(hav(float(trail[i-1][0]),float(trail[i-1][1]),float(trail[i][0]),float(trail[i][1])) for i in range(1,len(trail)) if len(trail[i])==2)
+
+class VideoGen:
+    SZ=(480,480); FPS=15; TOTAL=150
+    def __init__(self, out):
+        self.out = Path(out)
+        bg = Image.new("RGB", self.SZ, (9,10,15))
+        d = ImageDraw.Draw(bg)
+        for x in range(0,self.SZ[0],40): d.line([(x,0),(x,self.SZ[1])], fill=(18,22,32))
+        for y in range(0,self.SZ[1],40): d.line([(0,y),(self.SZ[0],y)], fill=(18,22,32))
+        self.bg = bg.tobytes()
+    def style(self, km):
+        if km<2: return True,80000,(0,255,204),6
+        if km<5: return True,40000,(0,210,255),5
+        if km<15: return False,20000,(255,159,28),4
+        return False,10000,(255,42,133),3
+    def gen(self, pid, trail):
+        if not trail or len(trail)<2: return None
+        try:
+            lons=[float(p[0]) for p in trail]; lats=[float(p[1]) for p in trail]
+            km = trail_dist(trail)/1000
+            follow,scale,color,lw = self.style(km)
+            cum=[0.0]
+            for i in range(1,len(trail)): cum.append(cum[-1]+hav(lons[i-1],lats[i-1],lons[i],lats[i]))
+            total=max(1.0,cum[-1]); cx,cy=(min(lons)+max(lons))/2,(min(lats)+max(lats))/2
+            fdir=self.out/f"fr_{pid}"; fdir.mkdir(exist_ok=True)
+            for f in range(self.TOTAL):
+                prog=f/(self.TOTAL-1)
+                if prog<0.04: alpha=int(255*prog/0.04)
+                elif prog>0.94: alpha=int(255*(1-prog)/0.06)
+                else: alpha=255
+                if f<12:
+                    img=Image.frombytes("RGB",self.SZ,self.bg); d=ImageDraw.Draw(img,"RGBA")
+                    ta=int(255*f/12); d.text((240,220),f"{km:.1f} KM",fill=(0,255,204,ta),anchor="mm")
+                    d.text((240,270),"UZ RUN",fill=(255,255,255,ta),anchor="mm")
+                    img.save(fdir/f"f_{f:04d}.png"); continue
+                motion=max(0.0,min(1.0,(prog-0.06)/0.85))**0.9
+                target=motion*total
+                ci=0
+                for i in range(1,len(cum)):
+                    if cum[i]>=target: ci=i; break
+                else: ci=len(trail)-1
+                clon,clat=lons[ci],lats[ci]
+                cam_lon=clon if follow else cx; cam_lat=clat if follow else cy
+                def px(lon,lat): return ((lon-cam_lon)*scale+240, -(lat-cam_lat)*scale+240)
+                img=Image.frombytes("RGB",self.SZ,self.bg); d=ImageDraw.Draw(img,"RGBA")
+                prev=None
+                for i in range(len(trail)):
+                    p=px(lons[i],lats[i])
+                    if prev: d.line([prev,p],fill=(color[0]//3,color[1]//3,color[2]//3,60),width=2)
+                    prev=p
+                prev=None
+                for i in range(ci+1):
+                    p=px(lons[i],lats[i])
+                    if prev: d.line([prev,p],fill=(color[0],color[1],color[2],alpha),width=lw)
+                    prev=p
+                dx,dy=px(clon,clat)
+                for r,a in [(18,40),(10,80),(6,255)]:
+                    d.ellipse([dx-r,dy-r,dx+r,dy+r],fill=(color[0],color[1],color[2],int(a*alpha/255)))
+                d.ellipse([dx-3,dy-3,dx+3,dy+3],fill=(255,255,255,alpha))
+                img.save(fdir/f"f_{f:04d}.png")
+            out=self.out/f"{pid}.mp4"
+            subprocess.run(["ffmpeg","-y","-framerate",str(self.FPS),"-i",str(fdir/"f_%04d.png"),"-c:v","libx264","-pix_fmt","yuv420p","-preset","fast","-crf","24",str(out)],check=True,capture_output=True,timeout=120)
+            shutil.rmtree(fdir, ignore_errors=True)
+            return f"/videos/{pid}.mp4" if out.exists() and out.stat().st_size>1000 else None
+        except Exception as e:
+            print(f"Vid {pid}: {e}"); return None
+
+vq = queue.Queue()
+def vworker():
+    g = VideoGen(VID)
+    while True:
+        j = vq.get()
+        try:
+            path = g.gen(j["post_id"], j["trail"])
+            if path: db("UPDATE posts SET video_path=%s, video_status='ready' WHERE id=%s",(path,j["post_id"]))
+            else: db("UPDATE posts SET video_status='error' WHERE id=%s",(j["post_id"],))
+        except:
+            try: db("UPDATE posts SET video_status='error' WHERE id=%s",(j["post_id"],))
+            except: pass
+        finally: vq.task_done()
+threading.Thread(target=vworker, daemon=True).start()
+print("   ✅ Video")
+
+print("🌐 Tunnel...")
+cf = WORKDIR/"cloudflared"
+if not cf.exists():
+    urllib.request.urlretrieve("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64", str(cf))
+    cf.chmod(0o755)
+cflog = WORKDIR/"cf.log"
+if cflog.exists(): cflog.unlink()
+subprocess.Popen([str(cf),"tunnel","--url",f"http://127.0.0.1:{APP_PORT}","--logfile",str(cflog)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+URL = f"http://127.0.0.1:{APP_PORT}"
+for _ in range(40):
+    if cflog.exists():
+        m = re.search(r"https://[a-z0-9\-]+\.trycloudflare\.com", cflog.read_text(errors="ignore"))
+        if m: URL = m.group(0); break
+    time.sleep(0.5)
+print(f"   ✅ {URL}")
+
+# ==============================================================================
+# 📱 APK (unchanged)
+# ==============================================================================
+APKS = {"state":"BUILDING","progress":5,"message":"Yuklanmoqda...","apk_ready":False,"size_kb":0,"sha256":"","url":URL}
+
+JAVA = r'''package uz.runpro.app;
+import android.app.Activity;import android.content.Context;import android.content.Intent;import android.content.pm.ApplicationInfo;import android.content.pm.PackageManager;import android.graphics.Color;import android.hardware.Sensor;import android.hardware.SensorEvent;import android.hardware.SensorEventListener;import android.hardware.SensorManager;import android.location.Location;import android.location.LocationListener;import android.location.LocationManager;import android.net.Uri;import android.os.Build;import android.os.Bundle;import android.os.Handler;import android.os.Looper;import android.os.SystemClock;import android.os.Vibrator;import android.view.Gravity;import android.view.View;import android.view.ViewGroup;import android.view.Window;import android.view.WindowManager;import android.webkit.GeolocationPermissions;import android.webkit.JavascriptInterface;import android.webkit.ValueCallback;import android.webkit.WebChromeClient;import android.webkit.WebSettings;import android.webkit.WebView;import android.webkit.WebViewClient;import android.widget.FrameLayout;import android.widget.ImageView;import android.widget.LinearLayout;import android.widget.TextView;import java.io.BufferedReader;import java.io.File;import java.io.InputStreamReader;import org.json.JSONObject;
+class GCC extends WebChromeClient{private ValueCallback<Uri[]> mCb;private static final int REQ=102;private MainActivity act;GCC(MainActivity a){act=a;}@Override public void onGeolocationPermissionsShowPrompt(String o,GeolocationPermissions.Callback c){c.invoke(o,true,false);}@Override public boolean onShowFileChooser(WebView w,ValueCallback<Uri[]> f,FileChooserParams p){if(mCb!=null)mCb.onReceiveValue(null);mCb=f;try{Intent i=p.createIntent();act.startActivityForResult(i,REQ);return true;}catch(Exception e){mCb=null;return false;}}public void handleResult(int rc,Intent d){if(mCb==null)return;Uri[] r=null;if(rc==Activity.RESULT_OK&&d!=null&&d.getData()!=null)r=new Uri[]{d.getData()};mCb.onReceiveValue(r);mCb=null;}}
+class SEC{static boolean emu(){return Build.FINGERPRINT.startsWith("generic")||Build.FINGERPRINT.startsWith("unknown")||Build.MODEL.contains("google_sdk")||Build.MODEL.contains("Emulator")||Build.MODEL.contains("Android SDK built for x86")||Build.MANUFACTURER.contains("Genymotion")||Build.HARDWARE.contains("goldfish")||Build.HARDWARE.contains("ranchu")||"sdk".equals(Build.PRODUCT);}static boolean root(){String[] p={"/system/app/Superuser.apk","/sbin/su","/system/bin/su","/system/xbin/su","/data/local/xbin/su","/su/bin/su","/system/xbin/daemonsu","/sbin/magisk"};for(String x:p)try{if(new File(x).exists())return true;}catch(Exception e){}try{Process p2=Runtime.getRuntime().exec(new String[]{"/system/xbin/which","su"});BufferedReader br=new BufferedReader(new InputStreamReader(p2.getInputStream()));String l=br.readLine();br.close();if(l!=null&&l.length()>0)return true;}catch(Exception e){}return false;}static boolean dbg(Context c){return (c.getApplicationInfo().flags&ApplicationInfo.FLAG_DEBUGGABLE)!=0;}static boolean frida(){String[] p={"/data/local/tmp/frida-server","/data/local/tmp/re.frida.server","/data/local/tmp/frida"};for(String x:p)try{if(new File(x).exists())return true;}catch(Exception e){}return false;}static boolean xposed(){try{throw new Exception();}catch(Exception e){for(StackTraceElement el:e.getStackTrace())if(el.getClassName().contains("de.robv.android.xposed"))return true;}try{Class.forName("de.robv.android.xposed.XposedBridge");return true;}catch(Throwable t){}return false;}static boolean fakegps(Context c){String[] pk={"com.lexa.fakegps","com.theappninjas.fakegps","ru.gavrikov.mocklocations"};PackageManager pm=c.getPackageManager();for(String p:pk)try{pm.getPackageInfo(p,0);return true;}catch(PackageManager.NameNotFoundException e){}return false;}static JSONObject audit(Context c){JSONObject j=new JSONObject();try{boolean r=root(),e=emu(),d=dbg(c),f=frida(),x=xposed(),g=fakegps(c);boolean t=!(r||e||d||f||x||g);String rr="OK";if(r)rr="ROOT";else if(e)rr="EMU";else if(d)rr="DBG";else if(f)rr="FRIDA";else if(x)rr="XP";else if(g)rr="FAKE";j.put("trusted",t);j.put("reason",rr);}catch(Exception ex){try{j.put("trusted",false);j.put("reason","ERR");}catch(Exception e2){}}return j;}@SuppressWarnings("deprecation")static boolean mock(Location l){if(Build.VERSION.SDK_INT>=31){try{if(l.isMock())return true;}catch(Exception e){}}try{if(l.isFromMockProvider())return true;}catch(Exception e){}return false;}static boolean usable(Location l){if(l==null||mock(l))return false;if(l.hasAccuracy()&&l.getAccuracy()>200f)return false;return true;}static boolean trusted(Location l){if(l==null||mock(l))return false;if(!l.hasAccuracy()||l.getAccuracy()>50f)return false;if(Math.abs(l.getTime()-System.currentTimeMillis())>30000)return false;if(l.hasSpeed()&&l.getSpeed()>12f)return false;return true;}}
+class StepL implements SensorEventListener{private float[] g=new float[3];private long lt=0;private int sc=0,ts=0;@Override public void onSensorChanged(SensorEvent e){final float a=0.8f;g[0]=a*g[0]+(1-a)*e.values[0];g[1]=a*g[1]+(1-a)*e.values[1];g[2]=a*g[2]+(1-a)*e.values[2];float x=e.values[0]-g[0],y=e.values[1]-g[1],z=e.values[2]-g[2];float m=(float)Math.sqrt(x*x+y*y+z*z);long n=System.nanoTime();if(m>11f&&n-lt>220000000L){sc++;ts++;lt=n;}}@Override public void onAccuracyChanged(Sensor s,int a){}public int steps(){return sc;}public int total(){return ts;}public void reset(){sc=0;lt=0;}}
+class Bridge{private MainActivity act;Bridge(MainActivity a){act=a;}@JavascriptInterface public String getAppVersion(){return "16.5.0-MSG";}@JavascriptInterface public String getSecurityStatus(){return SEC.audit(act).toString();}@JavascriptInterface public int getStepCount(){return act.steps();}@JavascriptInterface public void forceRefreshGps(){act.forceRefreshGps();}@JavascriptInterface public void vibrate(int ms){try{Vibrator v=(Vibrator)act.getSystemService(Context.VIBRATOR_SERVICE);if(v!=null)v.vibrate(ms);}catch(Exception e){}}}
+class WVC extends WebViewClient{private MainActivity act;WVC(MainActivity a){act=a;}@Override public void onPageFinished(WebView v,String u){act.pageReady();}}
+class EmitR implements Runnable{private MainActivity a;private double lat,lon;private float acc,spd;private boolean t;private String p;EmitR(MainActivity ac,Location l,boolean tr){a=ac;lat=l.getLatitude();lon=l.getLongitude();acc=l.hasAccuracy()?l.getAccuracy():99f;spd=l.hasSpeed()?l.getSpeed():0f;t=tr;p=l.getProvider()!=null?l.getProvider():"x";}public void run(){a.emit(lat,lon,acc,spd,t,p);}}
+class FadeR implements Runnable{private MainActivity a;FadeR(MainActivity ac){a=ac;}public void run(){a.splashFade();}}
+class ForceR implements Runnable{private MainActivity a;ForceR(MainActivity ac){a=ac;}public void run(){a.forceRefreshGps();}}
+class WatchR implements Runnable{private MainActivity a;WatchR(MainActivity ac){a=ac;}public void run(){try{a.gpsHealth();Handler h=a.watchH();if(h!=null)h.postDelayed(new WatchR(a),15000);}catch(Exception e){}}}
+public class MainActivity extends Activity implements LocationListener{
+private WebView wv;private LocationManager lm;private SensorManager sm;private StepL sl;private FrameLayout root;private LinearLayout splash;private long lastEmit=0,lastFix=0;private Location lastLoc;private Handler wh;private Runnable wr;private boolean gpsStarted=false;private static final int PERM=101;private static final String APP_URL="__URL__";private GCC gcc;
+Handler watchH(){return wh;}int steps(){return sl!=null?sl.steps():0;}
+@Override protected void onCreate(Bundle b){super.onCreate(b);requestWindowFeature(Window.FEATURE_NO_TITLE);getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);getWindow().setStatusBarColor(Color.parseColor("#04070e"));getWindow().setNavigationBarColor(Color.parseColor("#04070e"));root=new FrameLayout(this);root.setBackgroundColor(Color.parseColor("#04070e"));splash=new LinearLayout(this);splash.setOrientation(LinearLayout.VERTICAL);splash.setGravity(Gravity.CENTER);splash.setBackgroundColor(Color.parseColor("#04070e"));splash.setLayoutParams(new FrameLayout.LayoutParams(-1,-1));ImageView logo=new ImageView(this);logo.setImageResource(R.drawable.splash);logo.setLayoutParams(new LinearLayout.LayoutParams(220,220));TextView t=new TextView(this);t.setText("UZ RUN");t.setTextColor(Color.parseColor("#00ff87"));t.setTextSize(28);t.setGravity(Gravity.CENTER);t.setTypeface(null,1);splash.addView(logo);splash.addView(t);root.addView(splash);wv=new WebView(this);wv.setBackgroundColor(Color.parseColor("#04070e"));wv.setLayerType(View.LAYER_TYPE_HARDWARE,null);wv.setVisibility(View.INVISIBLE);WebSettings ws=wv.getSettings();ws.setJavaScriptEnabled(true);ws.setDomStorageEnabled(true);ws.setGeolocationEnabled(true);ws.setAllowFileAccess(true);ws.setAllowContentAccess(true);ws.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);ws.setMediaPlaybackRequiresUserGesture(false);ws.setUserAgentString(ws.getUserAgentString()+" UzRun/16.5");ws.setLoadWithOverviewMode(true);ws.setUseWideViewPort(true);gcc=new GCC(this);wv.addJavascriptInterface(new Bridge(this),"UzRunNative");wv.setWebChromeClient(gcc);wv.setWebViewClient(new WVC(this));wv.setLayoutParams(new FrameLayout.LayoutParams(-1,-1));root.addView(wv);setContentView(root);sm=(SensorManager)getSystemService(Context.SENSOR_SERVICE);sl=new StepL();Sensor acc=sm!=null?sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER):null;if(acc!=null)sm.registerListener(sl,acc,SensorManager.SENSOR_DELAY_GAME);if(Build.VERSION.SDK_INT>=23){if(checkSelfPermission("android.permission.ACCESS_FINE_LOCATION")!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{"android.permission.ACCESS_FINE_LOCATION","android.permission.ACCESS_COARSE_LOCATION"},PERM);}else startGps();}else startGps();wv.loadUrl(APP_URL+"/?c=apk16");}
+void forceRefreshGps(){if(Build.VERSION.SDK_INT>=23&&checkSelfPermission("android.permission.ACCESS_FINE_LOCATION")!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{"android.permission.ACCESS_FINE_LOCATION","android.permission.ACCESS_COARSE_LOCATION"},PERM);return;}emitLast();startGps();}
+void emitLast(){if(lm==null)return;Location l=null;try{l=lm.getLastKnownLocation(LocationManager.GPS_PROVIDER);}catch(Exception e){}if(l==null)try{l=lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER);}catch(Exception e){}if(l==null)try{l=lm.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER);}catch(Exception e){}if(l!=null&&SEC.usable(l))onLocationChanged(l);}
+void pageReady(){if(splash.getVisibility()==View.VISIBLE)splash.animate().alpha(0f).setDuration(400).withEndAction(new FadeR(this));new Handler(Looper.getMainLooper()).postDelayed(new ForceR(this),1500);}
+void splashFade(){splash.setVisibility(View.GONE);wv.setVisibility(View.VISIBLE);}
+void emit(double lat,double lon,float acc,float spd,boolean tr,String p){if(wv==null)return;long n=System.currentTimeMillis();if(n-lastEmit<300)return;lastEmit=n;try{String js="if(window.onNativeGps)window.onNativeGps("+lat+","+lon+","+acc+","+spd+","+tr+",'"+p+"');";wv.evaluateJavascript(js,null);}catch(Exception e){}}
+void startGps(){if(gpsStarted){emitLast();return;}try{if(lm==null)lm=(LocationManager)getSystemService(Context.LOCATION_SERVICE);if(lm==null)return;emitLast();boolean st=false;if(lm.isProviderEnabled(LocationManager.GPS_PROVIDER)){try{lm.requestLocationUpdates(LocationManager.GPS_PROVIDER,500L,0.5f,this);st=true;}catch(Exception e){}}if(lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)){try{lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER,1500L,1f,this);st=true;}catch(Exception e){}}if(lm.isProviderEnabled(LocationManager.PASSIVE_PROVIDER)){try{lm.requestLocationUpdates(LocationManager.PASSIVE_PROVIDER,3000L,2f,this);st=true;}catch(Exception e){}}gpsStarted=st;startWatch();}catch(SecurityException e){}}
+void startWatch(){if(wh!=null)return;wh=new Handler(Looper.getMainLooper());wr=new WatchR(this);wh.postDelayed(wr,15000);}
+void gpsHealth(){try{long d=lastFix>0?(System.currentTimeMillis()-lastFix)/1000:999;if(d>20&&lm!=null){try{lm.removeUpdates(this);gpsStarted=false;startGps();}catch(Exception e){}}}catch(Exception e){}}
+@Override public void onRequestPermissionsResult(int rc,String[] p,int[] r){super.onRequestPermissionsResult(rc,p,r);if(rc==PERM&&r.length>0&&r[0]==PackageManager.PERMISSION_GRANTED){startGps();if(wv!=null)wv.reload();}}
+@Override public void onLocationChanged(Location l){if(l==null||!SEC.usable(l))return;if(lastLoc!=null&&lastLoc.hasAccuracy()){long dt=l.getTime()-lastLoc.getTime();if(dt<1000&&l.getAccuracy()>lastLoc.getAccuracy())return;}lastLoc=l;lastFix=System.currentTimeMillis();runOnUiThread(new EmitR(this,l,SEC.trusted(l)));}
+@Override public void onStatusChanged(String p,int s,Bundle b){}@Override public void onProviderEnabled(String p){gpsStarted=false;startGps();}@Override public void onProviderDisabled(String p){}
+@Override public void onBackPressed(){if(wv!=null&&wv.canGoBack())wv.goBack();else super.onBackPressed();}
+@Override protected void onPause(){super.onPause();if(wv!=null)wv.onPause();}
+@Override protected void onResume(){super.onResume();if(wv!=null)wv.onResume();if(Build.VERSION.SDK_INT<23||checkSelfPermission("android.permission.ACCESS_FINE_LOCATION")==PackageManager.PERMISSION_GRANTED)forceRefreshGps();}
+@Override protected void onDestroy(){if(lm!=null)try{lm.removeUpdates(this);}catch(Exception e){}if(sm!=null&&sl!=null)try{sm.unregisterListener(sl);}catch(Exception e){}if(wh!=null&&wr!=null)try{wh.removeCallbacks(wr);}catch(Exception e){}super.onDestroy();}
+@Override protected void onActivityResult(int rc,int resc,Intent d){if(gcc!=null)gcc.handleResult(resc,d);super.onActivityResult(rc,resc,d);}
+}
+'''
+
+def build_apk():
+    try:
+        os.environ["JAVA_HOME"] = "/usr/lib/jvm/java-17-openjdk-amd64"
+        plat = SDK/"platforms"/"android-34"; aj = plat/"android.jar"
+        if not aj.exists():
+            APKS.update({"progress":15,"message":"Platform..."}); z = SDK/"p.zip"
+            urllib.request.urlretrieve("https://dl.google.com/android/repository/platform-34-ext7_r02.zip", str(z))
+            with zipfile.ZipFile(z) as zf:
+                for m in zf.namelist():
+                    if m.endswith("android.jar"):
+                        plat.mkdir(parents=True, exist_ok=True)
+                        with zf.open(m) as s, open(aj, "wb") as d: shutil.copyfileobj(s, d)
+                        break
+            z.unlink(missing_ok=True)
+        bt = SDK/"build-tools"/"34.0.0"; a2 = bt/"aapt2"
+        if not a2.exists():
+            APKS.update({"progress":30,"message":"Tools..."}); z = SDK/"bt.zip"
+            urllib.request.urlretrieve("https://dl.google.com/android/repository/build-tools_r34-linux.zip", str(z))
+            with zipfile.ZipFile(z) as zf: zf.extractall(SDK/"bt")
+            ext = list((SDK/"bt").glob("*"))[0]
+            bt.parent.mkdir(parents=True, exist_ok=True)
+            if bt.exists(): shutil.rmtree(bt)
+            shutil.move(str(ext), str(bt)); shutil.rmtree(SDK/"bt", ignore_errors=True); z.unlink(missing_ok=True)
+            for b in ["aapt2","zipalign","d8","apksigner"]:
+                p = bt/b
+                if p.exists(): p.chmod(0o755)
+        APKS.update({"progress":50,"message":"Yig'ish..."})
+        proj = SDK/"proj"
+        if proj.exists(): shutil.rmtree(proj)
+        src = proj/"src/uz/runpro/app"; res = proj/"res"; assets = proj/"assets"; cls = proj/"cls"
+        for d in [src, res/"values", res/"drawable", res/"mipmap-hdpi", res/"mipmap-xhdpi", res/"mipmap-xxhdpi", res/"mipmap-xxxhdpi", assets, cls]: d.mkdir(parents=True, exist_ok=True)
+        def icon(sz, pth):
+            im = Image.new("RGBA", (sz, sz), (0,0,0,0)); d = ImageDraw.Draw(im); r = sz//2
+            for rad in range(r, 0, -1):
+                t = 1.0 - (rad/r); d.ellipse([r-rad, r-rad, r+rad, r+rad], fill=(int(t*100), int(180+t*75), int(120+t*50), 255))
+            inner = int(r*0.82); d.ellipse([r-inner, r-inner, r+inner, r+inner], fill=(4,7,14,255))
+            a = int(r*0.42); d.polygon([(r,r-a),(r-a,r+a*0.7),(r,r+a*0.2),(r+a,r+a*0.7)], fill=(0,255,135,255)); im.save(pth, "PNG")
+        icon(72, res/"mipmap-hdpi/ic.png"); icon(96, res/"mipmap-xhdpi/ic.png"); icon(144, res/"mipmap-xxhdpi/ic.png"); icon(192, res/"mipmap-xxxhdpi/ic.png")
+        sp = Image.new("RGBA", (192, 192), (4,7,14,255)); sd = ImageDraw.Draw(sp)
+        sd.polygon([(96,48),(48,136),(96,110),(144,136)], fill=(0,255,135,255)); sp.save(res/"drawable/splash.png")
+        (res/"values/strings.xml").write_text('<?xml version="1.0" encoding="utf-8"?><resources><string name="app_name">UZ RUN</string></resources>')
+        (res/"values/styles.xml").write_text('<?xml version="1.0" encoding="utf-8"?><resources><style name="T" parent="@android:style/Theme.DeviceDefault.NoActionBar"><item name="android:windowBackground">#04070e</item></style></resources>')
+        (assets/"e.json").write_text(json.dumps({"url":URL,"v":"16.5"}))
+        (proj/"AndroidManifest.xml").write_text('''<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="uz.runpro.app" android:versionCode="165" android:versionName="16.5.0">
+<uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34"/>
+<uses-permission android:name="android.permission.INTERNET"/>
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION"/>
+<uses-permission android:name="android.permission.VIBRATE"/>
+<uses-permission android:name="android.permission.WAKE_LOCK"/>
+<uses-permission android:name="android.permission.CAMERA"/>
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+<uses-feature android:name="android.hardware.location.gps" android:required="true"/>
+<uses-feature android:name="android.hardware.sensor.accelerometer" android:required="true"/>
+<application android:label="@string/app_name" android:icon="@mipmap/ic" android:usesCleartextTraffic="true" android:hardwareAccelerated="true" android:theme="@style/T" android:allowBackup="false">
+<activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait" android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize" android:launchMode="singleTask">
+<intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+</activity></application></manifest>''')
+        (src/"MainActivity.java").write_text(JAVA.replace("__URL__", URL))
+        APKS.update({"progress":70,"message":"Compile..."})
+        rz = proj/"r.zip"; ua = proj/"u.apk"
+        subprocess.run([str(a2),"compile","--dir",str(res),"-o",str(rz)], check=True)
+        subprocess.run([str(a2),"link","-I",str(aj),"--manifest",str(proj/"AndroidManifest.xml"),"-A",str(assets),"--java",str(proj/"src"),"-o",str(ua),str(rz)], check=True)
+        subprocess.run(["javac","-source","8","-target","8","-g","-Xlint:-options","-Xlint:-deprecation","-bootclasspath",str(aj),"-cp",str(aj),"-d",str(cls),str(src/"R.java"),str(src/"MainActivity.java")], check=True)
+        classes = [str(p) for p in cls.rglob("*.class")]
+        print(f"   📦 {len(classes)} classes")
+        APKS.update({"progress":85,"message":"D8..."})
+        d8_ok = False; d8_errors = []
+        for attempt, extra in enumerate([[], ["--no-desugaring"], ["--min-api","21"]]):
+            try:
+                cmd = ["java","-Xmx1536M","-cp",str(bt/"lib/d8.jar"),"com.android.tools.r8.D8","--min-api","24","--lib",str(aj),"--output",str(proj)] + extra + classes
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                if r.returncode == 0: d8_ok = True; print(f"   ✅ D8 OK (attempt {attempt+1})"); break
+                else: d8_errors.append((r.stderr or "?")[-300:])
+            except Exception as e: d8_errors.append(str(e)[:200])
+        if not d8_ok: raise Exception(f"D8 failed: {d8_errors[-1][:200]}")
+        with zipfile.ZipFile(ua, "a") as zf: zf.write(proj/"classes.dex", "classes.dex")
+        APKS.update({"progress":95,"message":"Sign..."})
+        al = proj/"a.apk"; fn = BUILD/"v16.apk"; ks = SDK/"k.ks"
+        subprocess.run([str(bt/"zipalign"),"-f","-p","4",str(ua),str(al)], check=True)
+        if not ks.exists():
+            subprocess.run(["keytool","-genkeypair","-keystore",str(ks),"-alias","k","-keyalg","RSA","-keysize","2048","-validity","10000","-storepass","Uz2025!","-keypass","Uz2025!","-dname","CN=UzRun,O=Uz,C=UZ"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["java","-jar",str(bt/"lib/apksigner.jar"),"sign","--ks",str(ks),"--ks-pass","pass:Uz2025!","--key-pass","pass:Uz2025!","--out",str(fn),str(al)], check=True)
+        sz = fn.stat().st_size; sha = hashlib.sha256(fn.read_bytes()).hexdigest()
+        db("INSERT INTO build_artifacts (platform,filename,size_bytes,sha256,status,built_at) VALUES ('APK',%s,%s,%s,'OK',%s) ON CONFLICT (platform) DO UPDATE SET size_bytes=EXCLUDED.size_bytes,sha256=EXCLUDED.sha256,built_at=EXCLUDED.built_at",(fn.name,sz,sha,time.time()))
+        APKS.update({"state":"READY","progress":100,"message":"APK tayyor!","apk_ready":True,"size_kb":round(sz/1024,1),"sha256":sha})
+        print(f"   ✅ APK {round(sz/1024,1)}KB")
+    except Exception as e:
+        APKS.update({"state":"ERR","message":f"{str(e)[:150]}"}); print(f"   ⚠️ {e}")
+
+threading.Thread(target=build_apk, daemon=True).start()
+
+# ==============================================================================
+# 🧠 Backend
+# ==============================================================================
+app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 30*1024*1024
+PAL = ["#ff2a85","#ff9f1c","#00d2ff","#c084fc","#facc15","#fb7185","#38bdf8","#e879f9"]
+TRAIL_TTL = 1800.0
+
+def get_user():
+    a = request.headers.get("Authorization","")
+    if not a.startswith("Bearer "): return None
+    tok = a[7:].strip(); uid = verify_token(tok)
+    if not uid: return None
+    r = db("SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=%s AND s.expires_at>%s",(tok,time.time()),fetch=True)
+    return r[0] if r else None
+
+def world(uid):
+    db("DELETE FROM active_trails WHERE updated_at<%s",(time.time()-TRAIL_TTL,))
+    rows = db("SELECT u.id,u.username,u.color,u.total_distance_m,u.total_runs,u.last_lon,u.last_lat,at.coords_json AS tj FROM users u LEFT JOIN active_trails at ON at.user_id=u.id ORDER BY u.total_distance_m DESC, u.total_runs DESC", fetch=True)
+    ps = []
+    for i, r in enumerate(rows):
+        try: tr = json.loads(r["tj"]) if r.get("tj") else []
+        except: tr = []
+        if len(tr) > 1500: tr = tr[-1500:]
+        ps.append({"id":str(r["id"]),"name":r["username"],"isSelf":r["id"]==uid,"color":"#00d2ff" if r["id"]==uid else r["color"],"distanceKm":round(float(r["total_distance_m"] or 0)/1000,2),"runs":int(r["total_runs"] or 0),"pos":[float(r["last_lon"]),float(r["last_lat"])],"trail":tr,"isRunning":len(tr)>0,"rank":i+1})
+    return {"ok":True,"players":ps}
+
+@app.route("/api/health")
+def health(): return jsonify({"ok":True,"version":"16.5","apk":APKS["state"]})
+
+@app.route("/api/register", methods=["POST"])
+def reg():
+    d = request.get_json(silent=True) or {}
+    u, p = str(d.get("username","")).strip(), str(d.get("password","")).strip()
+    if len(u) < 3 or len(u) > 24 or len(p) < 4: return jsonify({"ok":False,"error":"Login 3-24, parol 4+"}), 400
+    if db("SELECT id FROM users WHERE LOWER(username)=LOWER(%s)",(u,),fetch=True): return jsonify({"ok":False,"error":"Login band"}), 409
+    s = secrets.token_hex(16); ph = stretch(p, s); n = time.time()
+    cnt = db("SELECT COUNT(*) AS c FROM users",fetch=True)[0]["c"]; col = PAL[cnt % len(PAL)]
+    uid = db("INSERT INTO users (username,pw_hash,pw_salt,color,created_at,last_gps_ts) VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",(u,ph,s,col,n,n),fetch=True)[0]["id"]
+    exp = int(n + 86400*30); tok = sign_token(uid, u, exp)
+    db("INSERT INTO sessions (token,user_id,expires_at) VALUES (%s,%s,%s)",(tok,uid,exp))
+    return jsonify({"ok":True,"token":tok,"user":{"id":uid,"username":u,"color":col,"bio":"","total_distance_m":0,"total_runs":0}})
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    d = request.get_json(silent=True) or {}
+    u, p = str(d.get("username","")).strip(), str(d.get("password","")).strip()
+    r = db("SELECT * FROM users WHERE LOWER(username)=LOWER(%s)",(u,),fetch=True)
+    if not r or stretch(p, r[0]["pw_salt"]) != r[0]["pw_hash"]: return jsonify({"ok":False,"error":"Xato"}), 401
+    us = r[0]; exp = int(time.time() + 86400*30); tok = sign_token(us["id"], us["username"], exp)
+    db("INSERT INTO sessions (token,user_id,expires_at) VALUES (%s,%s,%s)",(tok,us["id"],exp))
+    return jsonify({"ok":True,"token":tok,"user":{"id":us["id"],"username":us["username"],"color":us["color"]}})
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    a = request.headers.get("Authorization","")
+    if a.startswith("Bearer "): db("DELETE FROM sessions WHERE token=%s",(a[7:].strip(),))
+    return jsonify({"ok":True})
+
+@app.route("/api/me")
+def me():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    return jsonify({"ok":True,"user":{"id":u["id"],"username":u["username"],"color":u["color"],"bio":u.get("bio",""),"total_distance_m":u["total_distance_m"],"total_runs":u["total_runs"]}})
+
+@app.route("/api/world_state")
+def ws():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    return jsonify(world(u["id"]))
+
+@app.route("/api/start_trail", methods=["POST"])
+def start():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    db("DELETE FROM active_trails WHERE user_id=%s",(u["id"],))
+    return jsonify(world(u["id"]))
+
+@app.route("/api/sync_trail", methods=["POST"])
+def sync():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    d = request.get_json(silent=True) or {}
+    if not d.get("trusted"): return jsonify({"ok":False,"anticheat_blocked":True,"error":"Ishonchsiz"}), 403
+    now = time.time(); pos = d.get("pos"); npts = d.get("new_points",[]) or []
+    steps = int(d.get("steps",0)); acc = float(d.get("accuracy",99)); prov = str(d.get("provider","unknown"))
+    if isinstance(pos,list) and len(pos)==2:
+        try: lat, lon = float(pos[1]), float(pos[0])
+        except: lat = lon = None
+        if lat is not None:
+            dt = max(0.1, now - (u["last_gps_ts"] or 0))
+            dm = math.hypot((lat-(u["last_lat"] or 0))*111320, (lon-(u["last_lon"] or 0))*85000)
+            if dm > 3:
+                ok, why = check_physics(u["id"], dm, dt, steps, acc, prov)
+                if not ok:
+                    db("DELETE FROM active_trails WHERE user_id=%s",(u["id"],))
+                    return jsonify({"ok":False,"anticheat_blocked":True,"error":f"Anti-Cheat: {why}"}), 403
+            db("UPDATE users SET last_lon=%s,last_lat=%s,last_gps_ts=%s WHERE id=%s",(lon,lat,now,u["id"]))
+    if npts:
+        v = []
+        for p in npts[:500]:
+            if isinstance(p,list) and len(p)==2:
+                try: v.append([float(p[0]), float(p[1])])
+                except: pass
+        if v:
+            ex = db("SELECT coords_json FROM active_trails WHERE user_id=%s",(u["id"],),fetch=True)
+            tr = []
+            if ex:
+                try: tr = json.loads(ex[0]["coords_json"])
+                except: pass
+            tr.extend(v)
+            if len(tr) > 5000: tr = tr[-5000:]
+            db("INSERT INTO active_trails (user_id,coords_json,updated_at) VALUES (%s,%s,%s) ON CONFLICT (user_id) DO UPDATE SET coords_json=EXCLUDED.coords_json,updated_at=EXCLUDED.updated_at",(u["id"],json.dumps(tr),now))
+    else:
+        db("UPDATE active_trails SET updated_at=%s WHERE user_id=%s",(now,u["id"]))
+    return jsonify(world(u["id"]))
+
+@app.route("/api/stop_trail", methods=["POST"])
+def stop():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    d = request.get_json(silent=True) or {}
+    dur = float(d.get("duration_sec",0)); st = int(d.get("steps",0)); cap = str(d.get("caption",""))[:500]
+    now = time.time()
+    ex = db("SELECT coords_json FROM active_trails WHERE user_id=%s",(u["id"],),fetch=True)
+    dm, tr = 0.0, []
+    if ex:
+        try: tr = json.loads(ex[0]["coords_json"]); dm = trail_dist(tr)
+        except: pass
+    db("DELETE FROM active_trails WHERE user_id=%s",(u["id"],))
+    pid = None
+    if dm > 5:
+        rid = db("INSERT INTO runs (user_id,distance_m,duration_sec,steps,created_at) VALUES (%s,%s,%s,%s,%s) RETURNING id",(u["id"],dm,max(0,dur),max(0,st),now),fetch=True)[0]["id"]
+        db("UPDATE users SET total_distance_m=total_distance_m+%s, total_runs=total_runs+1 WHERE id=%s",(dm,u["id"]))
+        pace = (dur/(dm/1000)) if dm > 0 else 0
+        pid = db("INSERT INTO posts (user_id,run_id,caption,distance_m,duration_sec,pace_sec_per_km,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",(u["id"],rid,cap,dm,dur,pace,now),fetch=True)[0]["id"]
+        vq.put({"post_id":pid, "trail":tr})
+    r = world(u["id"]); r["post_id"] = pid
+    return jsonify(r)
+
+@app.route("/api/posts/create", methods=["POST"])
+def post_create():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    d = request.get_json(silent=True) or {}
+    cap = str(d.get("caption",""))[:500]
+    now = time.time()
+    pid = db("INSERT INTO posts (user_id,caption,distance_m,duration_sec,pace_sec_per_km,created_at) VALUES (%s,%s,0,0,0,%s) RETURNING id",(u["id"],cap,now),fetch=True)[0]["id"]
+    return jsonify({"ok":True,"post_id":pid})
+
+@app.route("/api/feed")
+def feed():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    bef = float(request.args.get("before", time.time()))
+    lim = min(30, int(request.args.get("limit",20)))
+    rows = db("SELECT p.*,u.username,u.color,(SELECT COUNT(*) FROM post_likes WHERE post_id=p.id AND user_id=%s) AS i_liked FROM posts p JOIN users u ON u.id=p.user_id WHERE p.created_at<%s ORDER BY p.created_at DESC LIMIT %s",(u["id"],bef,lim),fetch=True)
+    return jsonify({"ok":True,"posts":[dict(r) for r in rows]})
+
+@app.route("/api/posts/<int:pid>")
+def getpost(pid):
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    r = db("SELECT p.*,u.username,u.color,(SELECT COUNT(*) FROM post_likes WHERE post_id=p.id AND user_id=%s) AS i_liked FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=%s",(u["id"],pid),fetch=True)
+    return jsonify({"ok":True,"post":dict(r[0])}) if r else (jsonify({"ok":False}), 404)
+
+@app.route("/api/posts/<int:pid>/like", methods=["POST"])
+def like(pid):
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    if db("SELECT 1 FROM post_likes WHERE post_id=%s AND user_id=%s",(pid,u["id"]),fetch=True):
+        db("DELETE FROM post_likes WHERE post_id=%s AND user_id=%s",(pid,u["id"]))
+        db("UPDATE posts SET likes_count=GREATEST(0,likes_count-1) WHERE id=%s",(pid,))
+        return jsonify({"ok":True,"liked":False})
+    db("INSERT INTO post_likes (post_id,user_id,created_at) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",(pid,u["id"],time.time()))
+    db("UPDATE posts SET likes_count=likes_count+1 WHERE id=%s",(pid,))
+    return jsonify({"ok":True,"liked":True})
+
+@app.route("/api/posts/<int:pid>/comments")
+def cmts(pid):
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    r = db("SELECT c.*,u.username,u.color FROM comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=%s ORDER BY c.created_at ASC",(pid,),fetch=True)
+    return jsonify({"ok":True,"comments":[dict(x) for x in r]})
+
+@app.route("/api/posts/<int:pid>/comment", methods=["POST"])
+def addcmt(pid):
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    text = str((request.get_json(silent=True) or {}).get("text","")).strip()[:500]
+    if not text: return jsonify({"ok":False}), 400
+    db("INSERT INTO comments (post_id,user_id,text,created_at) VALUES (%s,%s,%s,%s)",(pid,u["id"],text,time.time()))
+    db("UPDATE posts SET comments_count=comments_count+1 WHERE id=%s",(pid,))
+    return jsonify({"ok":True})
+
+@app.route("/api/upload", methods=["POST"])
+def upload():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    f = request.files.get("file"); ttype = request.form.get("type","post"); tid = int(request.form.get("target_id","0"))
+    if not f: return jsonify({"ok":False,"error":"Fayl yo'q"}), 400
+    mt = f.mimetype or ""
+    if mt.startswith("image/"): kind = "photo"
+    elif mt.startswith("video/"): kind = "video"
+    else: return jsonify({"ok":False,"error":"Faqat rasm/video"}), 400
+    ext = {"image/jpeg":"jpg","image/png":"png","image/webp":"webp","video/mp4":"mp4","video/webm":"webm","video/quicktime":"mov"}.get(mt,"bin")
+    fn = f"{kind}_{u['id']}_{int(time.time())}_{secrets.token_hex(3)}.{ext}"
+    fp = (PHOT if kind == "photo" else VID)/fn
+    f.save(str(fp))
+    if kind == "photo":
+        try: im = Image.open(fp); im.thumbnail((1600,1600), Image.LANCZOS); im.convert("RGB").save(fp, optimize=True, quality=85)
+        except: pass
+    url = f"/{'photos' if kind=='photo' else 'videos'}/{fn}"
+    col = "photo_path" if kind == "photo" else "video_path"
+    if ttype == "post": db(f"UPDATE posts SET {col}=%s WHERE id=%s AND user_id=%s",(url,tid,u["id"]))
+    elif ttype == "chat": db(f"INSERT INTO chat_messages (from_id,to_id,{col},created_at) VALUES (%s,%s,%s,%s)",(u["id"],tid,url,time.time()))
+    return jsonify({"ok":True,"url":url})
+
+@app.route("/api/chat/list")
+def chatlist():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    rows = db("""SELECT DISTINCT ON (other_id) other_id, username, color, text, photo_path, video_path, created_at
+        FROM (SELECT CASE WHEN from_id=%s THEN to_id ELSE from_id END AS other_id, u.username, u.color, m.text, m.photo_path, m.video_path, m.created_at
+              FROM chat_messages m JOIN users u ON u.id=(CASE WHEN m.from_id=%s THEN m.to_id ELSE m.from_id END)
+              WHERE m.from_id=%s OR m.to_id=%s) t ORDER BY other_id, created_at DESC""",(u["id"],u["id"],u["id"],u["id"]),fetch=True)
+    unread = db("SELECT from_id, COUNT(*) AS c FROM chat_messages WHERE to_id=%s AND read_at=0 GROUP BY from_id",(u["id"],),fetch=True)
+    umap = {r["from_id"]:r["c"] for r in unread}
+    conv = [dict(r) for r in rows]
+    for c in conv: c["unread"] = umap.get(c["other_id"], 0)
+    return jsonify({"ok":True,"conversations":conv})
+
+@app.route("/api/chat/unread")
+def chat_unread():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    r = db("SELECT COUNT(*) AS c FROM chat_messages WHERE to_id=%s AND read_at=0",(u["id"],),fetch=True)
+    return jsonify({"ok":True,"count":int(r[0]["c"]) if r else 0})
+
+@app.route("/api/chat/<int:oid>/messages")
+def chatmsgs(oid):
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    bef = float(request.args.get("before", time.time()+1))
+    rows = db("SELECT m.*,u.username,u.color FROM chat_messages m JOIN users u ON u.id=m.from_id WHERE ((m.from_id=%s AND m.to_id=%s) OR (m.from_id=%s AND m.to_id=%s)) AND m.created_at<%s ORDER BY m.created_at DESC LIMIT 50",(u["id"],oid,oid,u["id"],bef),fetch=True)
+    rows.reverse()
+    db("UPDATE chat_messages SET read_at=%s WHERE from_id=%s AND to_id=%s AND read_at=0",(time.time(),oid,u["id"]))
+    return jsonify({"ok":True,"messages":[dict(r) for r in rows]})
+
+@app.route("/api/chat/<int:oid>/send", methods=["POST"])
+def chatsend(oid):
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    text = str((request.get_json(silent=True) or {}).get("text","")).strip()[:1000]
+    if not text: return jsonify({"ok":False}), 400
+    db("INSERT INTO chat_messages (from_id,to_id,text,created_at) VALUES (%s,%s,%s,%s)",(u["id"],oid,text,time.time()))
+    return jsonify({"ok":True})
+
+@app.route("/api/profile/<int:uid>")
+def profile(uid):
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    r = db("SELECT id,username,color,bio,total_distance_m,total_runs FROM users WHERE id=%s",(uid,),fetch=True)
+    if not r: return jsonify({"ok":False}), 404
+    posts = db("SELECT id,video_path,video_status,photo_path,distance_m,duration_sec,likes_count,comments_count,created_at FROM posts WHERE user_id=%s ORDER BY created_at DESC LIMIT 40",(uid,),fetch=True)
+    return jsonify({"ok":True,"profile":dict(r[0]),"posts":[dict(p) for p in posts]})
+
+@app.route("/api/profile/bio", methods=["POST"])
+def set_bio():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    bio = str((request.get_json(silent=True) or {}).get("bio",""))[:200]
+    db("UPDATE users SET bio=%s WHERE id=%s",(bio,u["id"]))
+    return jsonify({"ok":True})
+
+@app.route("/api/search")
+def search():
+    u = get_user()
+    if not u: return jsonify({"ok":False}), 401
+    q = request.args.get("q","").strip()[:30]
+    if not q: return jsonify({"ok":True,"users":[]})
+    rows = db("SELECT id,username,color,total_distance_m,total_runs FROM users WHERE LOWER(username) LIKE %s AND id!=%s ORDER BY total_distance_m DESC LIMIT 20",(f"%{q.lower()}%",u["id"]),fetch=True)
+    return jsonify({"ok":True,"users":[dict(r) for r in rows]})
+
+@app.route("/api/build_status")
+def bs(): return jsonify(APKS)
+
+@app.route("/videos/<path:n>")
+def vserve(n):
+    if "/" in n or ".." in n: return "x", 400
+    f = VID/n
+    return send_file(str(f), mimetype="video/mp4", conditional=True) if f.exists() else ("nf", 404)
+
+@app.route("/photos/<path:n>")
+def pserve(n):
+    if "/" in n or ".." in n: return "x", 400
+    f = PHOT/n
+    if not f.exists(): return "nf", 404
+    return send_file(str(f), mimetype="image/jpeg" if n.endswith(".jpg") else "image/png" if n.endswith(".png") else "image/webp")
+
+@app.route("/download/v16.apk")
+def dl():
+    f = BUILD/"v16.apk"
+    return send_file(str(f), as_attachment=True, download_name="uz-run-v16.apk", mimetype="application/vnd.android.package-archive") if f.exists() else ("nf", 404)
+
+@app.route("/download")
+def dlp():
+    return Response(f"""<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>UZ RUN v16.5</title><style>body{{background:#090a0f;color:#e8edf5;font-family:system-ui;padding:20px;min-height:100vh;display:flex;align-items:center;justify-content:center}}.c{{max-width:480px;width:100%;background:rgba(13,16,27,.85);border:1px solid rgba(0,255,204,.3);border-radius:24px;padding:28px}}h1{{font-size:24px;margin-bottom:8px}}p{{color:#94a3b8;font-size:13px;margin-bottom:18px}}.bar{{height:8px;background:#1e293b;border-radius:99px;overflow:hidden;margin:12px 0}}.f{{height:100%;background:linear-gradient(90deg,#00ffcc,#00d2ff);width:0%;transition:width .3s}}.btn{{display:flex;align-items:center;justify-content:center;padding:14px;border-radius:13px;font-weight:900;text-decoration:none;background:linear-gradient(135deg,#00ffcc,#00d2ff);color:#03120a;margin-bottom:12px}}.btn.off{{opacity:.5;pointer-events:none}}</style></head><body><div class="c"><h1>🛡️ UZ RUN v16.5</h1><p>Map + Profile + Chat badge fixed</p><div class="bar"><div class="f" id="f"></div></div><div style="font-size:12px;margin-bottom:12px" id="s">...</div><a id="d" class="btn off" href="/download/v16.apk">⏳ APK...</a></div><script>async function q(){{try{{const r=await fetch('/api/build_status'),x=await r.json();document.getElementById('s').textContent=x.message;document.getElementById('f').style.width=x.progress+'%';if(x.apk_ready){{const b=document.getElementById('d');b.classList.remove('off');b.textContent='📥 APK ('+x.size_kb+' KB)';return}}}}catch(e){{}}setTimeout(q,1500)}}q()</script></body></html>""", mimetype="text/html")
+
+@app.route("/")
+def index(): return Response(FRONTEND, mimetype="text/html")
+
+# ==============================================================================
+# 🎮 FRONTEND v16.5 — CRITICAL FIXES
+# ==============================================================================
+FRONTEND = r"""<!DOCTYPE html><html lang="uz"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><title>UZ RUN</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" onerror="this.onerror=null;this.href='https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css'"/>
+<style>
+:root{--bg:#090a0f;--pn:rgba(13,16,27,.92);--bd:rgba(0,255,204,.25);--n:#00ffcc;--c:#00d2ff;--d:#ff0055;--t:#e8edf5;--m:#7a8ba0;--g:blur(14px) saturate(180%)}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;user-select:none}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--t);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px}
+#map{position:absolute;inset:0;z-index:1;background:#0d1f3a}
+#ac{position:absolute;inset:0;z-index:2;pointer-events:none}
+/* ✅ CRITICAL FIX: !important */
+.hd2{display:none!important}
+#ag{position:fixed;inset:0;z-index:9999;background:radial-gradient(circle at 50% 0%,#0d1f3a,var(--bg) 70%);display:flex;align-items:center;justify-content:center;padding:20px}
+#ag.h{display:none}
+.ac{width:100%;max-width:400px;background:var(--pn);backdrop-filter:var(--g);border:1px solid var(--bd);border-radius:24px;padding:32px 24px;box-shadow:0 20px 60px rgba(0,0,0,.8)}
+.ab{display:inline-block;padding:6px 14px;border-radius:99px;background:rgba(0,255,204,.1);color:var(--n);font-size:10px;font-weight:800;letter-spacing:1px;margin-bottom:16px;border:1px solid rgba(0,255,204,.2)}
+.at{font-size:28px;font-weight:900;letter-spacing:-1px;margin-bottom:8px;background:linear-gradient(90deg,#fff,var(--c));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.as{font-size:13px;color:var(--m);margin-bottom:24px}
+.tab{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:rgba(15,23,42,.9);padding:5px;border-radius:14px;margin-bottom:20px}
+.tab>div{padding:12px;text-align:center;font-size:13px;font-weight:700;border-radius:10px;cursor:pointer;color:var(--m);transition:all .3s}
+.tab>div.a{background:var(--n);color:#03120a}
+.ai{width:100%;padding:15px;border-radius:12px;border:1px solid rgba(148,163,184,.2);background:rgba(15,23,42,.85);color:var(--t);font-size:15px;margin-bottom:12px;outline:none;font-family:inherit}
+.ai:focus{border-color:var(--n)}
+.abt{width:100%;padding:16px;border:none;border-radius:12px;background:linear-gradient(135deg,var(--n),var(--c));color:#03120a;font-size:16px;font-weight:900;cursor:pointer;font-family:inherit}
+.abt:disabled{opacity:.6}
+.ae{margin-top:14px;font-size:12px;color:var(--d);text-align:center;min-height:18px;font-weight:700}
+#ht{position:fixed;top:max(12px,env(safe-area-inset-top));left:12px;right:12px;z-index:20;display:flex;justify-content:center;pointer-events:none}
+.tc{pointer-events:auto;width:100%;max-width:540px;height:56px;background:var(--pn);backdrop-filter:var(--g);border:1px solid var(--bd);border-radius:18px;padding:0 16px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.un{font-size:14px;font-weight:900;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:90px}
+.mt{display:flex;gap:14px;background:rgba(0,0,0,.3);padding:8px 14px;border-radius:12px;flex:1;justify-content:center}
+.mv{font-size:13px;font-weight:900;font-variant-numeric:tabular-nums}
+.mv.n{color:var(--n)}.mv.c{color:var(--c)}
+.mu{font-size:9px;color:var(--m);font-weight:700}
+.ib{width:40px;height:40px;border-radius:12px;border:1px solid rgba(148,163,184,.2);background:rgba(0,0,0,.4);color:var(--t);display:flex;align-items:center;justify-content:center;cursor:pointer}
+.ib.on{border-color:var(--n);background:rgba(0,255,204,.15);color:var(--n)}
+.ib svg{width:20px;height:20px}
+#toast{position:fixed;top:calc(max(12px,env(safe-area-inset-top))+70px);left:50%;transform:translateX(-50%) translateY(-10px);z-index:100;background:var(--pn);backdrop-filter:var(--g);border:1px solid var(--bd);padding:12px 20px;border-radius:99px;font-size:13px;font-weight:800;pointer-events:none;opacity:0;transition:all .3s;max-width:92vw;text-align:center}
+#toast.s{opacity:1;transform:translateX(-50%) translateY(0)}
+#toast.d{border-color:var(--d);color:#ffb3c6}
+#rd{position:fixed;bottom:calc(88px + env(safe-area-inset-bottom));left:12px;right:12px;z-index:20;display:flex;justify-content:center}
+.dc{display:flex;align-items:center;gap:10px;background:var(--pn);backdrop-filter:var(--g);border:1px solid var(--bd);padding:8px;border-radius:99px}
+.rb{border:none;background:linear-gradient(135deg,var(--n),var(--c));color:#03120a;padding:14px 24px;border-radius:99px;font-size:14px;font-weight:900;cursor:pointer;font-family:inherit;box-shadow:0 0 20px rgba(0,255,204,.4);transition:all .2s}
+.rb:active{transform:scale(.96)}
+.rb.run{background:linear-gradient(135deg,var(--d),#e11d48);color:#fff;box-shadow:0 0 25px rgba(255,0,85,.6)}
+.gp{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:800;color:var(--m);padding:10px 14px;border-radius:99px;background:rgba(0,0,0,.4);border:1px solid rgba(148,163,184,.16);cursor:pointer}
+.gp.a{color:var(--n);border-color:rgba(0,255,204,.4)}
+.gp.e{color:var(--d)}
+.gd{width:8px;height:8px;border-radius:50%;background:var(--m)}
+.gd.a{background:var(--n);box-shadow:0 0 10px var(--n)}
+.gd.e{background:var(--d)}
+.cb{width:46px;height:46px;border-radius:50%;border:1px solid rgba(148,163,184,.2);background:rgba(0,0,0,.4);color:var(--t);display:flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0}
+.cb svg{width:20px;height:20px}
+#bn{position:fixed;bottom:0;left:0;right:0;height:calc(72px + env(safe-area-inset-bottom));background:rgba(9,10,15,.95);backdrop-filter:var(--g);border-top:1px solid rgba(0,255,204,.15);display:grid;grid-template-columns:repeat(4,1fr);z-index:30;padding-bottom:env(safe-area-inset-bottom);padding-top:8px}
+.ni{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;color:#4a5a70;font-size:10px;font-weight:800;cursor:pointer;position:relative;padding:6px;transition:color .3s}
+.ni svg{width:24px;height:24px;stroke-width:2}
+.ni.a{color:var(--n)}
+.ni.a::before{content:'';position:absolute;top:-8px;left:50%;transform:translateX(-50%);width:32px;height:3px;background:var(--n);border-radius:0 0 4px 4px;box-shadow:0 0 12px var(--n)}
+.chat-badge{position:absolute;top:2px;right:calc(50% - 20px);background:var(--d);color:#fff;font-size:9px;font-weight:900;padding:2px 5px;border-radius:99px;min-width:16px;text-align:center;display:none}
+.sh{position:fixed;top:calc(max(12px,env(safe-area-inset-top))+68px);left:12px;right:12px;bottom:calc(88px + env(safe-area-inset-bottom));z-index:40;background:rgba(9,10,15,.98);backdrop-filter:var(--g);border:1px solid var(--bd);border-radius:24px;padding:20px;overflow-y:auto;display:none;max-width:540px;margin:0 auto}
+.sh.o{display:block}
+.sh.f{bottom:0;border-radius:24px 24px 0 0}
+.hd{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid rgba(255,255,255,.1);position:sticky;top:0;background:rgba(9,10,15,.98);z-index:2}
+.tt{font-size:18px;font-weight:900}
+.x{background:rgba(255,255,255,.1);border:none;color:var(--m);width:34px;height:34px;border-radius:50%;cursor:pointer;font-weight:900;display:flex;align-items:center;justify-content:center}
+.x:active{background:var(--d);color:#fff}
+.add-btn{background:linear-gradient(135deg,var(--n),var(--c));color:#03120a;border:none;padding:8px 16px;border-radius:99px;font-weight:900;font-size:12px;cursor:pointer;font-family:inherit}
+.add-btn:active{transform:scale(.95)}
+.pc{background:rgba(15,23,42,.6);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:14px;margin-bottom:14px}
+.ph{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.av{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;color:#03120a;font-size:14px;flex-shrink:0;cursor:pointer}
+.av.lg{width:80px;height:80px;font-size:24px}
+.av.sm{width:32px;height:32px;font-size:12px}
+.pn{font-weight:900;font-size:14px}
+.pt{font-size:11px;color:var(--m)}
+.pm{margin:10px 0;border-radius:12px;overflow:hidden;background:#000}
+.pm video,.pm img{width:100%;display:block;max-height:400px;object-fit:cover}
+.pp{width:100%;aspect-ratio:1/1;display:flex;flex-direction:column;align-items:center;justify-content:center;background:linear-gradient(135deg,#0d1f3a,#090a0f);border-radius:12px;color:var(--m);font-size:13px;gap:8px}
+.pp .sp{width:40px;height:40px;border:3px solid rgba(0,255,204,.2);border-top-color:var(--n);border-radius:50%;animation:sp 1s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.ps{display:flex;gap:14px;margin:8px 0;font-size:12px;font-weight:800;color:var(--m)}
+.pcp{margin:10px 0;font-size:14px;line-height:1.4}
+.pa{display:flex;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.08)}
+.abtn{flex:1;display:flex;align-items:center;justify-content:center;gap:6px;padding:10px;border-radius:10px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);color:var(--t);font-size:12px;font-weight:800;cursor:pointer;font-family:inherit}
+.abtn.l{background:rgba(255,0,85,.15);border-color:rgba(255,0,85,.4);color:#ff4d8c}
+.abtn svg{width:16px;height:16px}
+.ci{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.cb2{flex:1}
+.cu{font-weight:900;font-size:12px}
+.ctx{font-size:13px;margin-top:2px;line-height:1.4}
+.ctm{font-size:10px;color:var(--m);margin-top:3px}
+.cir{position:sticky;bottom:0;background:rgba(9,10,15,.98);padding:12px 0 0;display:flex;gap:8px;border-top:1px solid rgba(255,255,255,.1)}
+.cir input{flex:1;padding:12px;border-radius:12px;border:1px solid rgba(148,163,184,.2);background:rgba(15,23,42,.9);color:var(--t);font-size:14px;outline:none;font-family:inherit}
+.cir button{padding:12px 20px;border-radius:12px;border:none;background:linear-gradient(135deg,var(--n),var(--c));color:#03120a;font-weight:900;cursor:pointer;font-family:inherit}
+.phd{display:flex;flex-direction:column;align-items:center;gap:10px;padding:20px 0}
+.pn2{font-size:22px;font-weight:900}
+.pb{font-size:13px;color:var(--m);text-align:center;max-width:300px;cursor:pointer;padding:8px 12px;border-radius:8px;background:rgba(255,255,255,.03);min-width:200px}
+.pb:hover{border:1px solid var(--n)}
+.ps2{display:flex;gap:20px;margin-top:10px}
+.pst{text-align:center}
+.pst .v{font-size:20px;font-weight:900;color:var(--n)}
+.pst .l{font-size:10px;color:var(--m);font-weight:700;text-transform:uppercase}
+.pg{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:16px}
+.gi{aspect-ratio:1/1;border-radius:8px;overflow:hidden;background:#0d1f3a;position:relative;cursor:pointer}
+.gi video,.gi img{width:100%;height:100%;object-fit:cover}
+.si{width:100%;padding:14px;border-radius:14px;border:1px solid rgba(148,163,184,.2);background:rgba(15,23,42,.9);color:var(--t);font-size:15px;margin-bottom:16px;outline:none;font-family:inherit}
+.si:focus{border-color:var(--n)}
+.ur{display:flex;align-items:center;gap:12px;padding:12px;border-radius:14px;background:rgba(15,23,42,.6);border:1px solid rgba(255,255,255,.05);margin-bottom:8px;cursor:pointer}
+.ur .in{flex:1}
+.ur .nm{font-weight:900;font-size:14px}
+.ur .me{font-size:11px;color:var(--m);margin-top:2px}
+.cl{display:flex;align-items:center;gap:12px;padding:12px;border-radius:14px;background:rgba(15,23,42,.6);border:1px solid rgba(255,255,255,.05);margin-bottom:8px;cursor:pointer}
+.cl .inf{flex:1;overflow:hidden}
+.cl .nm{font-weight:900;font-size:14px}
+.cl .lm{font-size:12px;color:var(--m);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cl .badge{background:var(--n);color:#03120a;font-weight:900;padding:2px 8px;border-radius:99px;font-size:11px;min-width:20px;text-align:center}
+.msgs{padding:10px 0;min-height:200px;display:flex;flex-direction:column;gap:6px}
+.msg{max-width:75%;padding:10px 14px;border-radius:16px;font-size:14px;line-height:1.4;word-wrap:break-word;position:relative}
+.msg.out{align-self:flex-end;background:linear-gradient(135deg,#00d2ff,#00a8cc);color:#03120a;border-bottom-right-radius:4px}
+.msg.in{align-self:flex-start;background:rgba(30,41,59,.9);border-bottom-left-radius:4px}
+.msg img,.msg video{max-width:250px;border-radius:10px;display:block;margin-bottom:4px}
+.mt2{font-size:9px;opacity:.7;margin-top:4px;text-align:right}
+.empty-state{text-align:center;padding:40px 20px;color:var(--m)}
+.empty-state .ico{font-size:56px;margin-bottom:12px}
+.empty-state .txt{font-size:14px;margin-bottom:16px;line-height:1.5}
+.empty-state button{background:linear-gradient(135deg,var(--n),var(--c));color:#03120a;border:none;padding:12px 24px;border-radius:12px;font-weight:900;font-size:14px;cursor:pointer;font-family:inherit}
+.empty-state button:active{transform:scale(.95)}
+.modal{position:fixed;inset:0;z-index:100;background:rgba(0,0,0,.85);display:none;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(8px)}
+.modal.o{display:flex}
+.modal .box{background:var(--pn);border:1px solid var(--bd);border-radius:24px;padding:24px;width:100%;max-width:400px}
+.modal .box h3{font-size:18px;margin-bottom:16px;font-weight:900}
+.modal textarea{width:100%;padding:14px;border-radius:12px;border:1px solid rgba(148,163,184,.2);background:rgba(15,23,42,.85);color:var(--t);font-size:15px;min-height:120px;outline:none;font-family:inherit;resize:vertical;margin-bottom:12px}
+.modal textarea:focus{border-color:var(--n)}
+.modal .actions{display:flex;gap:8px;margin-top:16px}
+.modal .actions button{flex:1;padding:12px;border-radius:12px;border:none;font-weight:900;font-size:14px;cursor:pointer;font-family:inherit}
+.modal .actions .cancel{background:rgba(255,255,255,.08);color:var(--t)}
+.modal .actions .ok{background:linear-gradient(135deg,var(--n),var(--c));color:#03120a}
+.photo-picker{display:flex;gap:8px;margin-bottom:12px}
+.photo-picker label{flex:1;padding:12px;border-radius:12px;border:1px dashed rgba(148,163,184,.3);background:rgba(15,23,42,.6);color:var(--m);text-align:center;font-size:13px;font-weight:800;cursor:pointer}
+.photo-picker label:active{border-color:var(--n);color:var(--n)}
+.photo-picker input{display:none}
+#mapStatus{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;color:var(--m);font-size:14px;padding:20px;z-index:1}
+.loading-spinner{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;color:var(--m);gap:16px}
+.loading-spinner .spin{width:48px;height:48px;border:3px solid rgba(0,255,204,.2);border-top-color:var(--n);border-radius:50%;animation:sp 1s linear infinite}
+</style></head><body>
+
+<div id="ag"><div class="ac"><div class="ab">v16.5 MESSENGER</div><div class="at">UZ RUN</div><div class="as">Yugur. Chat. Bo'lish.</div>
+<div class="tab"><div id="t1" class="a" onclick="sw('login')">Kirish</div><div id="t2" onclick="sw('reg')">Ro'yxat</div></div>
+<input class="ai" id="au" placeholder="Username" autocomplete="username"/>
+<input class="ai" id="ap" type="password" placeholder="Parol" autocomplete="current-password"/>
+<button class="abt" id="asb" onclick="sbm()">KIRISH</button>
+<div class="ae" id="ae"></div></div></div>
+
+<div id="map" class="hd2"><div id="mapStatus">📍 Xarita yuklanmoqda...</div></div>
+<canvas id="ac" class="hd2"></canvas>
+<div id="toast"></div>
+
+<div id="ht" class="hd2"><div class="tc"><div class="un" id="un">...</div><div class="mt"><div><span class="mv n" id="ud">0.00</span><span class="mu"> km</span></div><div><span class="mv c" id="us">0.0</span><span class="mu"> km/h</span></div><div><span class="mv" id="ur2">0</span><span class="mu"> runs</span></div></div><button class="ib" id="bst" onclick="sat()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/></svg></button></div></div>
+
+<div id="rd" class="hd2"><div class="dc"><button class="rb" id="bg" onclick="tgrun()">BOSHLASH</button><div class="gp" id="gs" onclick="retryg()"><div class="gd" id="gd"></div><span id="gt">GPS</span></div><button class="cb" onclick="ctr()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><circle cx="12" cy="12" r="3"/><path d="M12 1v6M12 17v6M1 12h6M17 12h6"/></svg></button></div></div>
+
+<div class="sh" id="sfeed"><div class="hd"><div class="tt">📱 LENTA</div><button class="add-btn" onclick="openNewPost()">+ POST</button></div><div id="fl"></div></div>
+
+<div class="sh" id="schat"><div class="hd"><div class="tt">💬 CHAT</div><button class="add-btn" onclick="openNewChat()">+ YANGI</button></div><div id="chl"></div></div>
+
+<div class="sh" id="ssearch"><div class="hd"><div class="tt">🔍 QIDIRISH</div><button class="x" onclick="opn('feed')">✕</button></div><input class="si" id="si" placeholder="Foydalanuvchi..." oninput="sr()"/><div id="sr2"></div></div>
+
+<div class="sh" id="sprofile"><div class="hd"><div class="tt">👤 PROFIL</div><button class="x" onclick="opn('feed')">✕</button></div><div id="pb"><div class="loading-spinner"><div class="spin"></div><div>Yuklanmoqda...</div></div></div></div>
+
+<div class="sh f" id="scmt"><div class="hd"><div class="tt">💬 IZOHLAR</div><button class="x" onclick="clc()">✕</button></div><div id="cl2"></div><div class="cir"><input id="cin" placeholder="Izoh..." maxlength="500"/><button onclick="scm()">➤</button></div></div>
+
+<div class="sh f" id="schatv"><div class="hd"><div class="tt" id="cht">CHAT</div><button class="x" onclick="clcv()">✕</button></div><div class="msgs" id="cms"></div><div class="cir"><label for="chatfile" class="cb" style="width:44px;height:44px;border-radius:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.1)">📎</label><input type="file" id="chatfile" accept="image/*,video/*" style="display:none" onchange="sendChatFile(event)"/><input id="cmi" placeholder="Xabar..." maxlength="1000"/><button onclick="scmv()">➤</button></div></div>
+
+<div class="modal" id="mNewChat"><div class="box"><h3>💬 Yangi chat</h3>
+<input class="ai" id="ncu" placeholder="Foydalanuvchi nomi..." style="margin-bottom:8px"/>
+<div id="ncres" style="max-height:200px;overflow-y:auto"></div>
+<div class="actions"><button class="cancel" onclick="closeNewChat()">BEKOR</button><button class="ok" onclick="startChatSearch()">QIDIRISH</button></div></div></div>
+
+<div class="modal" id="mNewPost"><div class="box"><h3>📝 Yangi post</h3>
+<textarea id="npc" placeholder="Nima deysiz?"></textarea>
+<div class="photo-picker"><label for="npfile">📷 Rasm qo'shish<input type="file" id="npfile" accept="image/*" onchange="previewPostPhoto(event)"/></label></div>
+<div id="nppreview" style="margin-bottom:8px"></div>
+<div class="actions"><button class="cancel" onclick="closeNewPost()">BEKOR</button><button class="ok" onclick="submitNewPost()">JOYLASH</button></div></div></div>
+
+<div class="modal" id="mBio"><div class="box"><h3>✏️ Bio tahrirlash</h3>
+<textarea id="bioin" placeholder="O'zingiz haqingizda..." maxlength="200"></textarea>
+<div class="actions"><button class="cancel" onclick="closeBio()">BEKOR</button><button class="ok" onclick="saveBio()">SAQLASH</button></div></div></div>
+
+<div id="bn" class="hd2">
+<div class="ni a" id="nfeed" onclick="opn('feed')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span>LENTA</span></div>
+<div class="ni" id="nchat" onclick="opn('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>CHAT</span><div class="chat-badge" id="chBadge">0</div></div>
+<div class="ni" id="nmap" onclick="opn('map')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/></svg><span>XARITA</span></div>
+<div class="ni" id="nprofile" onclick="opn('profile')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg><span>PROFIL</span></div>
+</div>
+
+<script>
+window._leafletReady = new Promise(function(resolve){
+  if(typeof L !== 'undefined') { resolve(true); return; }
+  var urls = ['https://unpkg.com/leaflet@1.9.4/dist/leaflet.js','https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js','https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js'];
+  var i = 0;
+  function tryNext(){
+    if(i >= urls.length){ resolve(false); return; }
+    var s = document.createElement('script'); s.src = urls[i++];
+    s.onload = function(){ if(typeof L !== 'undefined') resolve(true); else tryNext(); };
+    s.onerror = function(){ tryNext(); };
+    document.head.appendChild(s);
+  }
+  tryNext();
+});
+
+const MXS=25,MNPT=1.5,TZ=15,HB=10000,SY=1200,GPSA=300000,IAC=200,TMAX=5000;
+let TK=localStorage.getItem("uz16")||"",am="login",mp=null,mr=false;
+let PL=[],ME=null,TR=[],LSI=0,GR=false,NG=false,LGP=null,LGT=0,LGA=99,LPR="x";
+let LFT=0,SOK=true,FFR=false,IS=false,AF=true,LZL=0,GWD=null,GRC=0,WWI=null;
+let SYT=null,HBT=null,LST=0,CT="feed",CCP=null,MI=null,FB=0,FL=false,COID=null,COUSER=null;
+let TERR=null,TRL=null,SM=null,STM=null,MAP_INIT=false,CHAT_POLL=null,BADGE_POLL=null;
+
+try{if(window.UzRunNative&&window.UzRunNative.getAppVersion){const v=window.UzRunNative.getAppVersion();NG=!!(v&&v.indexOf("MSG")>=0)}}catch(e){}
+
+function H(a,b){const R=6371000;const la1=a[1]*Math.PI/180,la2=b[1]*Math.PI/180;const dL=(b[1]-a[1])*Math.PI/180,dO=(b[0]-a[0])*Math.PI/180;const h=Math.sin(dL/2)**2+Math.cos(la1)*Math.cos(la2)*Math.sin(dO/2)**2;return 2*R*Math.asin(Math.sqrt(Math.min(1,h)))}
+function T(m,d){try{const e=document.getElementById("toast");e.textContent=m;e.classList.add("s");if(d)e.classList.add("d");else e.classList.remove("d");clearTimeout(window._tt);window._tt=setTimeout(()=>e.classList.remove("s"),3500)}catch(e){}}
+function V(ms){try{if(window.UzRunNative&&window.UzRunNative.vibrate)window.UzRunNative.vibrate(ms);else if(navigator.vibrate)navigator.vibrate(ms)}catch(e){}}
+function SG(s,t){try{const p=document.getElementById("gs"),d=document.getElementById("gd"),tt=document.getElementById("gt");p.classList.remove("a","e");d.classList.remove("a","e");if(s){p.classList.add(s);d.classList.add(s)}tt.textContent=t}catch(e){}}
+function CS(){if(!NG||!window.UzRunNative||!window.UzRunNative.getSecurityStatus)return{trusted:true};try{const s=JSON.parse(window.UzRunNative.getSecurityStatus());SOK=s.trusted;return s}catch(e){return{trusted:false,reason:"F"}}}
+function GS(){if(NG&&window.UzRunNative&&window.UzRunNative.getStepCount){try{const n=window.UzRunNative.getStepCount()|0;if(n>0)return n}catch(e){}}return Math.floor(((ME&&ME.distanceKm)?ME.distanceKm*1000:0)/0.75)}
+function sw(m){am=m;document.getElementById("t1").classList.toggle("a",m==="login");document.getElementById("t2").classList.toggle("a",m==="reg");document.getElementById("ae").textContent=""}
+
+async function sbm(){
+  const u=document.getElementById("au").value.trim(),p=document.getElementById("ap").value.trim(),e=document.getElementById("ae");
+  if(!u||!p){e.textContent="To'liq kiriting!";return}
+  const b=document.getElementById("asb");b.disabled=true;b.textContent="...";e.textContent="";
+  const ctrl=new AbortController();const tid=setTimeout(()=>ctrl.abort(),10000);
+  try{
+    const r=await fetch(am==="login"?"/api/login":"/api/register",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u,password:p}),signal:ctrl.signal});
+    clearTimeout(tid);const d=await r.json();
+    if(!d.ok){e.textContent=d.error||"Xato";return}
+    TK=d.token;localStorage.setItem("uz16",TK);
+    document.getElementById("ag").classList.add("h");
+    await boot();
+  }catch(err){e.textContent=err.name==='AbortError'?"Timeout":"Ulanib bo'lmadi"}finally{b.disabled=false;b.textContent="KIRISH"}
+}
+async function AF2(u,o={}){o.headers=Object.assign({"Content-Type":"application/json","Authorization":"Bearer "+TK},o.headers||{});const r=await fetch(u,o);if(r.status===401){localStorage.removeItem("uz16");document.getElementById("ag").classList.remove("h");throw new Error("U")}return r.json()}
+
+// ✅ Boot: fetch MI first, then show UI, then open feed
+async function boot(){
+  try{
+    const r=await AF2("/api/me");
+    if(r.ok) MI=r.user;
+    else { TK=""; localStorage.removeItem("uz16"); document.getElementById("ag").classList.remove("h"); return; }
+  }catch(e){
+    T("Server bilan aloqa yo'q",true);
+    return;
+  }
+  // Show UI
+  document.querySelectorAll(".hd2").forEach(e=>e.classList.remove("hd2"));
+  // Open feed properly
+  await opn("feed");
+  // Start background tasks
+  if(!BADGE_POLL) BADGE_POLL = setInterval(updateChatBadge, 10000);
+  updateChatBadge();
+  try{await lf(true)}catch(e){}
+  try{await initMap()}catch(e){}
+  try{const d=await AF2("/api/world_state");if(d.ok)ap(d.players)}catch(e){}
+  try{rqg()}catch(e){}
+}
+
+async function initMap(){
+  if(MAP_INIT) return; MAP_INIT=true;
+  const ok = await window._leafletReady;
+  const statusEl = document.getElementById("mapStatus");
+  if(!ok){ if(statusEl) statusEl.innerHTML='📍 Xarita yuklanmadi'; return; }
+  if(typeof L === 'undefined'){ if(statusEl) statusEl.textContent='📍 Xato'; return; }
+
+  // ✅ OSM standard + soft dark filter (no green bug)
+  SM = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19, maxNativeZoom: 19, crossOrigin: true, attribution: '© OSM'
+  });
+  STM = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, maxNativeZoom: 18, attribution: '© Esri'
+  });
+  mp = L.map('map', {zoomControl: false, attributionControl: false, maxZoom: 19, minZoom: 3}).setView([41.2995, 69.2401], 14);
+  SM.addTo(mp);
+
+  // CSS soft dark filter
+  const style = document.createElement('style');
+  style.textContent = `#map .leaflet-tile-pane{filter:grayscale(1) invert(1) brightness(0.92) contrast(1.15)}`;
+  document.head.appendChild(style);
+
+  TERR = L.layerGroup().addTo(mp);
+  TRL = L.layerGroup().addTo(mp);
+  mp.on('dragstart',()=>{AF=false});
+  mp.on('zoomstart',()=>{AF=false});
+  mp.on('move',ra); mp.on('zoom',ra); mp.on('zoomend',oe);
+  mr=true; LZL=mp.getZoom();
+  if(statusEl) statusEl.remove();
+  setTimeout(()=>{if(mp)mp.invalidateSize()},300);
+  rm();
+}
+function oe(){if(!mp)return;const z=mp.getZoom();if(Math.abs(z-LZL)>=1){LZL=z;rm()}}
+
+async function opn(t){
+  CT=t;
+  ["feed","chat","map","profile","search"].forEach(k=>{
+    const ni=document.getElementById("n"+k); if(ni)ni.classList.toggle("a",k===t);
+    const sh=document.getElementById("s"+k); if(sh)sh.classList.toggle("o",k===t);
+  });
+  document.getElementById("map").classList.toggle("hd2",t!=="map");
+  document.getElementById("ac").classList.toggle("hd2",t!=="map");
+  document.getElementById("ht").classList.toggle("hd2",t!=="map");
+  document.getElementById("rd").classList.toggle("hd2",t!=="map");
+  if(t==="map"){ try{await initMap()}catch(e){} setTimeout(()=>{if(mp)mp.invalidateSize()},100); rm(); }
+  if(t==="feed") lf(true);
+  if(t==="chat") lc();
+  if(t==="profile") await lp();
+}
+
+// ✅ FIXED lp() — always loads, shows loading, handles errors
+async function lp(){
+  const pb = document.getElementById("pb");
+  pb.innerHTML = '<div class="loading-spinner"><div class="spin"></div><div>Yuklanmoqda...</div></div>';
+  try{
+    if(!MI){
+      const r = await AF2("/api/me");
+      if(r.ok) MI = r.user;
+      else throw new Error("no user");
+    }
+    if(!MI || !MI.id) throw new Error("MI null");
+    await vu(MI.id);
+  }catch(e){
+    console.error("Profile error:", e);
+    pb.innerHTML = `<div class="empty-state"><div class="ico">⚠️</div><div class="txt">Profil yuklanmadi</div><button onclick="lp()">QAYTA URINISH</button></div>`;
+    T("Profil xatosi",true);
+  }
+}
+
+async function lf(reset){
+  if(FL)return;FL=true;
+  if(reset){FB=Date.now()/1000+1;document.getElementById("fl").innerHTML='<div style="text-align:center;padding:20px;color:var(--m)">...</div>'}
+  try{
+    const r=await AF2("/api/feed?before="+FB+"&limit=15");
+    if(!r.ok)throw new Error();
+    const posts=r.posts||[]; const b=document.getElementById("fl"); if(reset)b.innerHTML="";
+    if(posts.length===0){
+      if(reset) b.innerHTML=`<div class="empty-state"><div class="ico">🏃</div><div class="txt">Hali post yo'q.<br>Birinchi bo'lib yuguring yoki post qo'shing!</div><button onclick="openNewPost()">+ YANGI POST</button></div>`;
+      return;
+    }
+    if(posts.length>0)FB=Math.min(...posts.map(p=>p.created_at));
+    for(const p of posts)b.insertAdjacentHTML("beforeend",rpost(p));
+    const pend=posts.filter(p=>p.video_status==="pending");
+    if(pend.length>0)setTimeout(async()=>{let c=false;for(const p of pend){try{const r=await AF2("/api/posts/"+p.id);if(r.ok&&r.post.video_status!=="pending")c=true}catch(e){}}if(c)lf(true)},5000);
+  }catch(e){if(reset)document.getElementById("fl").innerHTML='<div style="text-align:center;padding:20px;color:var(--d)">Xato</div>'}finally{FL=false}
+}
+
+function rpost(p){
+  const t=new Date(p.created_at*1000); const ago=ta(t);
+  const ini=(p.username||"?")[0].toUpperCase();
+  const pace=p.pace_sec_per_km>0?fp(p.pace_sec_per_km):"-";
+  let mh="";
+  if(p.video_status==="ready"&&p.video_path)mh=`<div class="pm"><video controls playsinline preload="metadata" src="${p.video_path}"></video></div>`;
+  else if(p.photo_path)mh=`<div class="pm"><img src="${p.photo_path}" loading="lazy"/></div>`;
+  else if(p.video_status==="pending")mh=`<div class="pp"><div class="sp"></div><div>Video...</div></div>`;
+  else if(p.distance_m>0)mh=`<div class="pp"><div style="font-size:40px">🏃</div><div>${(p.distance_m/1000).toFixed(2)} km</div></div>`;
+  const stats = p.distance_m>0 ? `<div class="ps"><div>📍 ${(p.distance_m/1000).toFixed(2)} km</div><div>⏱️ ${fd(p.duration_sec)}</div><div>🏃 ${pace}/km</div></div>` : "";
+  return `<div class="pc"><div class="ph"><div class="av" style="background:${p.color}" onclick="vu(${p.user_id})">${ini}</div><div style="flex:1"><div class="pn">${eh(p.username)}</div><div class="pt">${ago}</div></div></div>${mh}${p.caption?`<div class="pcp">${eh(p.caption)}</div>`:""}${stats}<div class="pa"><button class="abtn ${p.i_liked?'l':''}" onclick="tl(${p.id})"><svg viewBox="0 0 24 24" fill="${p.i_liked?'currentColor':'none'}" stroke="currentColor" stroke-width="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg><span>${p.likes_count||0}</span></button><button class="abtn" onclick="oc(${p.id})"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span>${p.comments_count||0}</span></button></div></div>`;
+}
+
+async function tl(id){try{const r=await AF2("/api/posts/"+id+"/like",{method:"POST"});if(r.ok){V(20);lf(true)}}catch(e){}}
+async function oc(id){CCP=id;document.getElementById("scmt").classList.add("o");await lc2(id)}
+async function lc2(id){try{const r=await AF2("/api/posts/"+id+"/comments");const b=document.getElementById("cl2");if(!r.ok||r.comments.length===0){b.innerHTML='<div style="text-align:center;padding:30px;color:var(--m)">Hali izoh</div>';return}b.innerHTML=r.comments.map(c=>`<div class="ci"><div class="av sm" style="background:${c.color}">${(c.username||"?")[0].toUpperCase()}</div><div class="cb2"><div class="cu">${eh(c.username)}</div><div class="ctx">${eh(c.text)}</div><div class="ctm">${ta(new Date(c.created_at*1000))}</div></div></div>`).join("")}catch(e){}}
+async function scm(){if(!CCP)return;const i=document.getElementById("cin"),t=i.value.trim();if(!t)return;i.value="";try{const r=await AF2("/api/posts/"+CCP+"/comment",{method:"POST",body:JSON.stringify({text:t})});if(r.ok){V(15);await lc2(CCP)}}catch(e){}}
+function clc(){document.getElementById("scmt").classList.remove("o");CCP=null;lf(true)}
+
+// ==== NEW POST ====
+function openNewPost(){document.getElementById("npc").value="";document.getElementById("nppreview").innerHTML="";document.getElementById("npfile").value="";document.getElementById("mNewPost").classList.add("o")}
+function closeNewPost(){document.getElementById("mNewPost").classList.remove("o")}
+function previewPostPhoto(ev){
+  const f = ev.target.files[0]; if(!f) return;
+  const r = new FileReader();
+  r.onload = e => { document.getElementById("nppreview").innerHTML = `<img src="${e.target.result}" style="width:100%;max-height:200px;object-fit:cover;border-radius:12px"/>`; };
+  r.readAsDataURL(f);
+}
+async function submitNewPost(){
+  const cap = document.getElementById("npc").value.trim();
+  const file = document.getElementById("npfile").files[0];
+  if(!cap && !file){ T("Matn yoki rasm kiriting",true); return; }
+  try{
+    const r = await AF2("/api/posts/create",{method:"POST",body:JSON.stringify({caption:cap})});
+    if(!r.ok){ T("Xato",true); return; }
+    const pid = r.post_id;
+    if(file){
+      const fd = new FormData(); fd.append("file",file); fd.append("type","post"); fd.append("target_id",pid);
+      const up = await fetch("/api/upload",{method:"POST",headers:{"Authorization":"Bearer "+TK},body:fd});
+      if(!up.ok){ T("Rasm yuklanmadi",true); }
+    }
+    closeNewPost(); V(100); T("Post qo'shildi!"); lf(true);
+  }catch(e){T("Xato",true)}
+}
+
+// ==== CHAT ====
+function openNewChat(){document.getElementById("ncu").value="";document.getElementById("ncres").innerHTML="";document.getElementById("mNewChat").classList.add("o")}
+function closeNewChat(){document.getElementById("mNewChat").classList.remove("o")}
+async function startChatSearch(){
+  const q = document.getElementById("ncu").value.trim();
+  const res = document.getElementById("ncres");
+  if(!q){ res.innerHTML=""; return; }
+  try{
+    const r = await AF2("/api/search?q="+encodeURIComponent(q));
+    if(!r.ok||r.users.length===0){ res.innerHTML='<div style="padding:12px;color:var(--m);text-align:center">Topilmadi</div>'; return; }
+    res.innerHTML = r.users.map(u=>`<div class="ur" onclick="startChatWith(${u.id},'${eh(u.username)}')"><div class="av" style="background:${u.color}">${(u.username||"?")[0].toUpperCase()}</div><div class="in"><div class="nm">${eh(u.username)}</div><div class="me">${(u.total_distance_m/1000).toFixed(1)} km</div></div></div>`).join("");
+  }catch(e){ res.innerHTML='<div style="padding:12px;color:var(--d)">Xato</div>'; }
+}
+function startChatWith(id,name){ closeNewChat(); ocv(id,name); }
+
+async function lc(){
+  try{
+    const r=await AF2("/api/chat/list");
+    const b=document.getElementById("chl");
+    if(!r.ok||r.conversations.length===0){
+      b.innerHTML=`<div class="empty-state"><div class="ico">💬</div><div class="txt">Hali chat yo'q.<br>Yangi chat boshlang!</div><button onclick="openNewChat()">+ YANGI CHAT</button></div>`;
+      return;
+    }
+    b.innerHTML=r.conversations.map(c=>`<div class="cl" onclick="ocv(${c.other_id},'${eh(c.username)}')"><div class="av" style="background:${c.color}">${(c.username||"?")[0].toUpperCase()}</div><div class="inf"><div class="nm">${eh(c.username)}</div><div class="lm">${c.text?eh(c.text):c.photo_path?"📷 Rasm":c.video_path?"🎬 Video":"..."}</div></div>${c.unread>0?`<div class="badge">${c.unread}</div>`:""}</div>`).join("");
+  }catch(e){}
+}
+
+async function updateChatBadge(){
+  if(!TK) return;
+  try{
+    const r = await AF2("/api/chat/unread");
+    if(r.ok){
+      const badge = document.getElementById("chBadge");
+      if(r.count > 0){
+        badge.textContent = r.count > 99 ? "99+" : r.count;
+        badge.style.display = "block";
+      } else {
+        badge.style.display = "none";
+      }
+    }
+  }catch(e){}
+}
+
+async function ocv(id,nm){COID=id;COUSER=nm;document.getElementById("cht").textContent=nm;document.getElementById("schatv").classList.add("o");await lcm();if(CHAT_POLL)clearInterval(CHAT_POLL);CHAT_POLL=setInterval(lcm,3000)}
+async function lcm(){
+  if(!COID)return;
+  try{
+    const r=await AF2("/api/chat/"+COID+"/messages");
+    const b=document.getElementById("cms");
+    if(!r.ok||r.messages.length===0){b.innerHTML='<div style="text-align:center;padding:30px;color:var(--m)">Xabar yo\'q</div>';return}
+    b.innerHTML=r.messages.map(m=>{const out=m.from_id!==COID;const cls=out?"out":"in";let media="";if(m.photo_path)media=`<img src="${m.photo_path}"/>`;else if(m.video_path)media=`<video controls src="${m.video_path}"></video>`;const t=new Date(m.created_at*1000);return `<div class="msg ${cls}">${media}${m.text?eh(m.text):""}<div class="mt2">${t.getHours()}:${String(t.getMinutes()).padStart(2,"0")}</div></div>`}).join("");
+    b.scrollTop=b.scrollHeight;
+    updateChatBadge();
+  }catch(e){}
+}
+async function scmv(){if(!COID)return;const i=document.getElementById("cmi"),t=i.value.trim();if(!t)return;i.value="";try{const r=await AF2("/api/chat/"+COID+"/send",{method:"POST",body:JSON.stringify({text:t})});if(r.ok){V(15);await lcm()}}catch(e){}}
+async function sendChatFile(ev){
+  const f = ev.target.files[0]; if(!f||!COID) return;
+  if(!f.type.startsWith("image/") && !f.type.startsWith("video/")){ T("Faqat rasm/video",true); return; }
+  try{
+    const fd = new FormData(); fd.append("file",f); fd.append("type","chat"); fd.append("target_id",COID);
+    const r = await fetch("/api/upload",{method:"POST",headers:{"Authorization":"Bearer "+TK},body:fd});
+    if(r.ok){ V(50); await lcm(); }
+    else T("Yuklanmadi",true);
+  }catch(e){T("Xato",true)}
+  ev.target.value = "";
+}
+function clcv(){document.getElementById("schatv").classList.remove("o");COID=null;COUSER=null;if(CHAT_POLL){clearInterval(CHAT_POLL);CHAT_POLL=null}lc()}
+
+// ==== SEARCH ====
+async function sr(){
+  const q=document.getElementById("si").value.trim();
+  const b=document.getElementById("sr2");
+  if(!q){b.innerHTML="";return}
+  try{const r=await AF2("/api/search?q="+encodeURIComponent(q));if(!r.ok)return;
+    if(r.users.length===0){b.innerHTML='<div style="text-align:center;padding:20px;color:var(--m)">Topilmadi</div>';return}
+    b.innerHTML=r.users.map(u=>`<div class="ur" onclick="vu(${u.id})"><div class="av" style="background:${u.color}">${(u.username||"?")[0].toUpperCase()}</div><div class="in"><div class="nm">${eh(u.username)}</div><div class="me">${(u.total_distance_m/1000).toFixed(1)} km</div></div></div>`).join("")}catch(e){}
+}
+
+// ==== PROFILE ====
+async function vu(id){
+  opn("profile");
+  const pb = document.getElementById("pb");
+  pb.innerHTML = '<div class="loading-spinner"><div class="spin"></div><div>Yuklanmoqda...</div></div>';
+  try{
+    const r=await AF2("/api/profile/"+id);
+    if(!r.ok){ pb.innerHTML='<div class="empty-state"><div class="ico">⚠️</div><div class="txt">Profil topilmadi</div></div>'; return; }
+    const p=r.profile, posts=r.posts||[], isMe=(id===MI?.id);
+    const bioHtml = p.bio
+      ? `<div class="pb" onclick="${isMe?'openBio()':''}">${eh(p.bio)}${isMe?' ✏️':''}</div>`
+      : (isMe ? `<div class="pb" onclick="openBio()" style="color:var(--m)">+ Bio qo'shish</div>` : "");
+    const actions = isMe ? `<div style="display:flex;gap:8px;margin-top:16px;width:100%;max-width:300px"><button class="add-btn" style="flex:1" onclick="openBio()">✏️ BIO</button><button class="add-btn" style="flex:1;background:rgba(255,0,85,.1);color:#ff4d8c;border:1px solid rgba(255,0,85,.4)" onclick="logout()">🚪 CHIQISH</button></div>` : `<button class="add-btn" style="margin-top:12px" onclick="startChatWith(${p.id},'${eh(p.username)}')">💬 Xabar yuborish</button>`;
+    pb.innerHTML=`
+      <div class="phd">
+        <div class="av lg" style="background:${p.color}">${(p.username||"?")[0].toUpperCase()}</div>
+        <div class="pn2">${eh(p.username)}</div>
+        ${bioHtml}
+        <div class="ps2">
+          <div class="pst"><div class="v">${(p.total_distance_m/1000).toFixed(1)}</div><div class="l">km</div></div>
+          <div class="pst"><div class="v">${p.total_runs}</div><div class="l">runs</div></div>
+        </div>
+        ${actions}
+      </div>
+      ${posts.length>0 ? `<div class="pg">${posts.map(pt=>`<div class="gi">${pt.video_path?`<video src="${pt.video_path}" preload="metadata" muted></video>`:pt.photo_path?`<img src="${pt.photo_path}"/>`:`<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--m);font-size:11px">${(pt.distance_m/1000).toFixed(1)}km</div>`}</div>`).join("")}</div>` : `<div style="text-align:center;padding:30px;color:var(--m);font-size:13px">Hali post yo'q</div>`}
+    `;
+  }catch(e){
+    console.error("vu error:", e);
+    pb.innerHTML='<div class="empty-state"><div class="ico">⚠️</div><div class="txt">Profil xatosi</div><button onclick="lp()">QAYTA</button></div>';
+  }
+}
+
+// ==== BIO ====
+function openBio(){document.getElementById("bioin").value = MI?.bio || "";document.getElementById("mBio").classList.add("o")}
+function closeBio(){document.getElementById("mBio").classList.remove("o")}
+async function saveBio(){
+  const bio = document.getElementById("bioin").value.trim();
+  try{
+    const r = await AF2("/api/profile/bio",{method:"POST",body:JSON.stringify({bio})});
+    if(r.ok){ MI.bio=bio; T("Saqlandi!"); V(50); closeBio(); lp(); }
+    else T("Xato",true);
+  }catch(e){T("Xato",true)}
+}
+async function logout(){
+  if(!confirm("Chiqishni tasdiqlaysizmi?")) return;
+  try{await AF2("/api/logout",{method:"POST"})}catch(e){}
+  localStorage.removeItem("uz16");TK="";MI=null;
+  if(BADGE_POLL){clearInterval(BADGE_POLL);BADGE_POLL=null}
+  document.getElementById("ag").classList.remove("h");
+  document.querySelectorAll(".hd2").forEach(e=>e.classList.add("hd2"));
+}
+
+// ==== GPS / RUN ====
+async function rqg(){SG("","GPS...");if(NG&&window.UzRunNative&&window.UzRunNative.forceRefreshGps){try{window.UzRunNative.forceRefreshGps()}catch(e){}}swg();sgw()}
+function swg(){if(!navigator.geolocation||WWI!==null)return;WWI=navigator.geolocation.watchPosition(p=>{const a=p.coords.accuracy||99;if(a>IAC)return;LFT=Date.now();LPR="web";SG("a","+"+Math.round(a)+"m");if(ME)ME.pos=[p.coords.longitude,p.coords.latitude];if(!FFR&&mp&&mr){FFR=true;mp.setView([p.coords.latitude,p.coords.longitude],16,{animate:true})}},e=>{if(e.code===1)SG("e","RUXSAT")},{enableHighAccuracy:true,maximumAge:5000,timeout:20000})}
+function sgw(){if(GWD)clearInterval(GWD);GWD=setInterval(()=>{if(!TK)return;const s=LFT>0?(Date.now()-LFT)/1000:999;if(s>25&&GRC<5){GRC++;SG("","GPS "+GRC+"/5");if(WWI!==null){try{navigator.geolocation.clearWatch(WWI)}catch(e){}WWI=null}swg();if(window.UzRunNative&&window.UzRunNative.forceRefreshGps){try{window.UzRunNative.forceRefreshGps()}catch(e){}}}else if(s>60){SG("e","TOPILMADI")}},4000)}
+function retryg(){GRC=0;LFT=0;if(WWI!==null){try{navigator.geolocation.clearWatch(WWI)}catch(e){}WWI=null}if(window.UzRunNative&&window.UzRunNative.forceRefreshGps){try{window.UzRunNative.forceRefreshGps()}catch(e){}}swg();SG("","QAYTA");T("GPS qayta")}
+
+function ap(l){PL=l;ME=PL.find(p=>p.isSelf)||null;if(ME){try{document.getElementById("un").textContent=ME.name;document.getElementById("ud").textContent=ME.distanceKm.toFixed(2);document.getElementById("ur2").textContent=ME.runs}catch(e){}}rm()}
+function rm(){if(!mr||!mp)return;try{TERR.clearLayers();TRL.clearLayers();if(mp.getZoom()<TZ)return;for(const p of PL){if(p.isSelf)continue;if(p.trail&&p.trail.length>=2){L.polyline(p.trail.map(c=>[c[1],c[0]]),{color:p.color,weight:2,opacity:.6,lineCap:"round"}).addTo(TRL)}}if(TR.length>=2){L.polyline(TR.map(c=>[c[1],c[0]]),{color:"#00d2ff",weight:3,opacity:.9,lineCap:"round"}).addTo(TRL)}}catch(e){}}
+function sat(){if(!mr)return;IS=!IS;try{if(IS){mp.removeLayer(SM);STM.addTo(mp);document.getElementById("bst").classList.add("on")}else{mp.removeLayer(STM);SM.addTo(mp);document.getElementById("bst").classList.remove("on")}}catch(e){}}
+function ctr(){AF=true;const p=(ME&&ME.pos)?ME.pos:LGP;if(p&&mp)mp.setView([p[1],p[0]],16,{animate:true})}
+
+async function ign(lat,lon,acc,spd,tr,pr){
+  const n=Date.now();const a=Number(acc)||99;if(a>IAC)return;
+  LFT=n;LGA=a;LPR=pr||"gps";SG("a","+"+Math.round(a)+"m");
+  const pt=[lon,lat];
+  if(!FFR&&mp&&mr){FFR=true;mp.setView([lat,lon],16,{animate:true})}
+  if(!GR){if(ME)ME.pos=pt;LGP=pt.slice();LGT=n;return}
+  if(NG&&!tr)return;if(!ME)return;if(a>60)return;
+  if(LGP){const j=H(LGP,pt);if(j>120)return;if(n-LGT>5000&&j>30){LGP=pt.slice();LGT=n;TR.push(pt.slice());return}if(n-LGT<400&&j<0.5)return}
+  LGP=pt.slice();LGT=n;await sm(pt);
+  if(mp&&AF)mp.panTo([lat,lon],{animate:true,duration:.5})
+}
+window.onNativeGps=function(lat,lon,acc,spd,tr,pr){LFT=Date.now();ign(lat,lon,acc,spd,tr,pr)};
+
+async function sm(t){
+  if(!ME)return;
+  const n=Date.now();const d=ME.pos?H(ME.pos,t):0;if(ME.pos&&d<0.5)return;
+  const dt=Math.max(.25,(n-(window._lst||n))/1000);window._lst=n;
+  const k=d>0?(d/dt)*3.6:0;
+  if(k>MXS&&d>15){T("Anti-Cheat",true);return}
+  try{document.getElementById("us").textContent=k.toFixed(1)}catch(e){}
+  if(TR.length===0)TR.push(t.slice());
+  else{const l=TR[TR.length-1];const m=H(l,t);if(m>=MNPT){TR.push(t.slice());if(TR.length>TMAX)TR=TR.slice(-TMAX);if(ME){ME.distanceKm=+(ME.distanceKm+m/1000).toFixed(6);try{document.getElementById("ud").textContent=ME.distanceKm.toFixed(2)}catch(e){}}}}
+  ME.pos=t.slice();rm();
+}
+
+async function stsync(f=false){
+  if(!GR||!ME)return;
+  const n=Date.now();const hn=TR.length>LSI;if(!hn&&!f&&n-LST<HB)return;
+  const np=hn?TR.slice(LSI):[];
+  try{const r=await AF2("/api/sync_trail",{method:"POST",body:JSON.stringify({pos:ME.pos,new_points:np,steps:GS(),accuracy:LGA,provider:LPR,trusted:SOK})});
+    if(r.ok){LSI=TR.length;LST=n;if(r.players)ap(r.players)}
+    else if(r.anticheat_blocked){T(r.error,true);await stopr(false)}
+  }catch(e){}
+}
+
+async function tgrun(){
+  if(GR){await stopr(true);return}
+  if(!ME){T("GPS kut");rqg();return}
+  const s=CS();if(!s.trusted){T(s.reason,true);return}
+  try{const r=await AF2("/api/start_trail",{method:"POST"});if(r.ok&&r.players)ap(r.players)}catch(e){T("Server xato",true);return}
+  TR=[];LSI=0;LST=0;if(ME.pos)TR.push(ME.pos.slice());
+  GR=true;LGP=ME.pos?ME.pos.slice():null;LGT=Date.now();AF=true;
+  document.getElementById("bg").classList.add("run");document.getElementById("bg").textContent="TO'XTATISH";
+  V(80);T("BOSHLANDI");rm();window._sst=Date.now();
+  if(SYT)clearInterval(SYT);SYT=setInterval(()=>stsync(false),SY);
+  if(HBT)clearInterval(HBT);HBT=setInterval(async()=>{if(!GR)return;if(Date.now()-LFT>GPSA){T("GPS uzoq",true);await stopr(true);return}await stsync(true)},HB);
+}
+
+async function stopr(rec){
+  if(!GR)return;const d=window._sst?Math.max(0,(Date.now()-window._sst)/1000):0;GR=false;
+  if(SYT){clearInterval(SYT);SYT=null}if(HBT){clearInterval(HBT);HBT=null}
+  try{await stsync(true);const r=await AF2("/api/stop_trail",{method:"POST",body:JSON.stringify({duration_sec:d,steps:GS(),caption:""})});
+    if(r.ok&&r.players)ap(r.players);
+    if(r.post_id){T("Post yaratildi!");await lf(true);opn("feed")}
+  }catch(e){}
+  TR=[];LSI=0;
+  document.getElementById("bg").classList.remove("run");document.getElementById("bg").textContent="BOSHLASH";
+  document.getElementById("us").textContent="0.0";rm();
+  if(rec!==false)T("SAQLANDI");
+}
+
+// ==== CANVAS ====
+const cv=document.getElementById("ac"),cx=cv.getContext("2d");
+function rs(){const d=window.devicePixelRatio||1;cv.width=window.innerWidth*d;cv.height=window.innerHeight*d;cx.setTransform(d,0,0,d,0,0)}
+window.addEventListener("resize",rs);rs();
+function ra(){
+  cx.clearRect(0,0,window.innerWidth,window.innerHeight);
+  if(mr&&mp&&CT==="map"){
+    const t=performance.now()*.003;
+    const m=(ME&&ME.pos)?ME.pos:LGP;
+    if(m){const p=mp.latLngToContainerPoint([m[1],m[0]]);
+      if(p.x>-40&&p.x<window.innerWidth+40&&p.y>-40&&p.y<window.innerHeight+40){
+        cx.save();cx.translate(p.x,p.y);
+        const pu=16+Math.sin(t)*4;cx.beginPath();cx.arc(0,0,pu,0,Math.PI*2);cx.fillStyle="rgba(0,210,255,.25)";cx.fill();
+        cx.beginPath();cx.arc(0,0,10,0,Math.PI*2);cx.fillStyle="#00d2ff";cx.fill();
+        cx.beginPath();cx.arc(0,0,10,0,Math.PI*2);cx.lineWidth=2.5;cx.strokeStyle="#fff";cx.stroke();
+        cx.restore();
+      }
+    }
+    for(const p of PL){
+      if(p.isSelf)continue;
+      const pp=mp.latLngToContainerPoint([p.pos[1],p.pos[0]]);
+      if(pp.x<-40||pp.x>window.innerWidth+40||pp.y<-40||pp.y>window.innerHeight+40)continue;
+      cx.save();cx.translate(pp.x,pp.y);
+      const pu=11+Math.sin(t+1)*3;cx.beginPath();cx.arc(0,0,pu,0,Math.PI*2);cx.fillStyle=p.color;cx.globalAlpha=.2;cx.fill();cx.globalAlpha=1;
+      cx.beginPath();cx.arc(0,0,8,0,Math.PI*2);cx.fillStyle=p.color;cx.fill();
+      cx.lineWidth=2;cx.strokeStyle="#fff";cx.stroke();
+      cx.restore();
+    }
+  }
+  requestAnimationFrame(ra);
+}
+requestAnimationFrame(ra);
+
+function ta(d){const s=Math.floor((Date.now()-d.getTime())/1000);if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m";if(s<86400)return Math.floor(s/3600)+"h";return Math.floor(s/86400)+"d"}
+function fd(s){s=Math.floor(s||0);const m=Math.floor(s/60),ss=s%60;return m+":"+String(ss).padStart(2,"0")}
+function fp(s){const m=Math.floor(s/60),ss=Math.floor(s%60);return m+":"+String(ss).padStart(2,"0")}
+function eh(s){return String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+
+setInterval(async()=>{if(!TK||!document.getElementById("ag").classList.contains("h"))return;if(GR)return;try{const r=await AF2("/api/world_state");if(r.ok)ap(r.players)}catch(e){}},5000);
+
+window.addEventListener("DOMContentLoaded",async()=>{
+  if(TK){
+    try{
+      const r=await AF2("/api/me");
+      if(r.ok){ MI=r.user; document.getElementById("ag").classList.add("h"); await boot(); }
+      else { localStorage.removeItem("uz16"); TK=""; }
+    }catch(e){}
+  }
+});
+</script></body></html>
+"""
+
+threading.Thread(target=lambda: serve(app, host="0.0.0.0", port=APP_PORT, threads=16), daemon=True).start()
+time.sleep(0.8)
+
+from IPython.display import display, HTML
+display(HTML(f"""
+<div style="background:linear-gradient(135deg,#090a0f,#0d101b);border:1px solid #00ffcc;border-radius:18px;padding:24px;color:#f8fafc;font-family:system-ui;box-shadow:0 10px 40px rgba(0,255,204,0.1)">
+<h2 style="margin:0 0 10px;font-size:26px;font-weight:900;color:#fff">🛡️ UZ RUN v16.5 — FULL FIX</h2>
+<p style="color:#94a3b8;font-size:14px;margin-bottom:16px">
+✅ <b>Header/run tugma boshqa tablarda yo'q</b> (CSS !important)<br>
+✅ <b>PROFIL bo'sh emas</b> — loading + error handling<br>
+✅ <b>Chat badge</b> — yangi xabarlar soni<br>
+✅ <b>Xarita</b> — OSM + yumshoq filter (yashil bug yo'q)<br>
+✅ Har tab alohida: LENTA, CHAT, XARITA (run), PROFIL
+</p>
+<div style="display:flex;gap:12px;flex-wrap:wrap">
+<a href="{URL}" target="_blank" style="background:linear-gradient(135deg,#00ffcc,#00d2ff);color:#090a0f;padding:12px 24px;border-radius:12px;font-weight:900;text-decoration:none">🌍 ILOVA</a>
+<a href="{URL}/download" target="_blank" style="background:#1e293b;color:#00ffcc;padding:12px 24px;border-radius:12px;font-weight:900;text-decoration:none;border:1px solid rgba(0,255,204,0.3)">📲 APK</a>
+<a href="{URL}/api/health" target="_blank" style="background:#1e293b;color:#7a8ba0;padding:12px 24px;border-radius:12px;font-weight:900;text-decoration:none;font-size:12px">🩺 HEALTH</a>
+</div>
+</div>
+"""))
+
+print("\n✅ v16.5 tayyor!")
+try:
+    while True: time.sleep(3600)
+except KeyboardInterrupt:
+    print("To'xtatildi")      
