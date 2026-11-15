@@ -1519,9 +1519,22 @@ def write_project() -> None:
                 shutil.copy2(dest, backup)
         dest.write_text(content, encoding="utf-8")
 
+    # Notebook kernels (Kaggle/Colab/Jupyter) do not define __file__.
+    # Resolve a stable generator name without depending on the execution mode.
+    generator_path = globals().get("__file__")
+    if generator_path:
+        generator_name = Path(str(generator_path)).name
+    else:
+        argv0 = str(sys.argv[0]) if sys.argv else ""
+        argv_name = Path(argv0).name if argv0 else ""
+        if argv_name.lower().endswith(".py") and argv_name not in {"ipykernel_launcher.py", "colab_kernel_launcher.py"}:
+            generator_name = argv_name
+        else:
+            generator_name = "YUGUR_ONE_CELL.py"
+
     manifest = {
         "project": "YUGUR",
-        "generator": Path(__file__).name,
+        "generator": generator_name,
         "files": len(FILES),
         "sha256": {k: hashlib.sha256(v.encode("utf-8")).hexdigest() for k, v in FILES.items()},
     }
