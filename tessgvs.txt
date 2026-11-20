@@ -1,0 +1,2858 @@
+# ==============================================================================
+# 🚀 OQIM-KOKORO 7.9.11 ULTRA-MAX FINAL — FULL SINGLE-CELL PRODUCTION SCRIPT
+#    Flow Matching TTS · BigVGAN-v2 24kHz · Strong Voice & Prosody Cloning
+#    362-Tensor Checkpoint Compatible (#21,500 Resume) · Console PNG + StudioUI
+#    Save -> HF every 2000 steps | Console log -> every 1000 steps
+# ==============================================================================
+from dataclasses import dataclass
+from collections import Counter, deque
+import base64, bisect, gc, io, json, math, multiprocessing as mp, os
+from pathlib import Path
+import random, re, secrets, shutil, subprocess, sys, time, traceback, warnings, zlib
+
+warnings.filterwarnings("ignore")
+
+# ------------------------------------------------------------------------------
+# 1. ENVIRONMENT & CACHE DIRECTORIES
+# ------------------------------------------------------------------------------
+TEMP_ROOT = Path("/temp")
+TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+for _k, _v in {
+    "HF_HOME": "/temp/hf_cache",
+    "HF_DATASETS_CACHE": "/temp/hf_cache_datasets",
+    "HUGGINGFACE_HUB_CACHE": "/temp/hf_cache_hub",
+    "TORCH_HOME": "/temp/torch_cache",
+    "TMPDIR": "/temp/tmp_dir",
+    "TEMP": "/temp/tmp_dir",
+    "TMP": "/temp/tmp_dir",
+    "MPLCONFIGDIR": "/temp/mpl_cache",
+}.items():
+    Path(_v).mkdir(parents=True, exist_ok=True)
+    os.environ[_k] = _v
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
+OQIM_MODE = os.environ.get("OQIM_MODE", "train")
+FRESH_START = os.environ.get("OQIM_FRESH", "0") == "1"
+
+def ensure_packages():
+    pkgs = [
+        "huggingface_hub", "pyarrow", "soundfile", "librosa",
+        "scipy", "matplotlib", "gdown", "numba"
+    ]
+    miss = []
+    for p in pkgs:
+        try:
+            __import__(p)
+        except ImportError:
+            miss.append(p)
+    if miss:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q"] + miss)
+
+ensure_packages()
+
+import numpy as np
+import scipy.signal
+import pyarrow.parquet as pq
+import soundfile as sf
+import librosa
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
+    from numba import njit
+    HAS_NUMBA = True
+except Exception:
+    HAS_NUMBA = False
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Sampler
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download, whoami
+from huggingface_hub.utils import disable_progress_bars
+from IPython.display import display, HTML, Image as IPyImage, update_display
+
+disable_progress_bars()
+try:
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+for _fn, _val in [
+    (lambda v: setattr(torch.backends.cudnn, "benchmark", v), False),
+    (lambda v: setattr(torch.backends.cudnn, "deterministic", v), False),
+    (lambda v: setattr(torch.backends.cuda.matmul, "allow_tf32", v), True),
+    (lambda v: setattr(torch.backends.cudnn, "allow_tf32", v), True),
+]:
+    try:
+        _fn(_val)
+    except Exception:
+        pass
+
+def _autocast(enabled=True, dtype=torch.float16):
+    try:
+        return torch.amp.autocast("cuda", dtype=dtype, enabled=enabled)
+    except Exception:
+        return torch.cuda.amp.autocast(enabled=enabled, dtype=dtype)
+
+def _make_scaler(enabled=True):
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except Exception:
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+# ------------------------------------------------------------------------------
+# 2. GLOBAL CONFIGURATION (CHECKPOINT COMPATIBLE — 362 TENSORS)
+# ------------------------------------------------------------------------------
+NEW_HF_TOKEN = "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"
+HF_TOKEN = NEW_HF_TOKEN.strip()
+os.environ["HF_TOKEN"] = HF_TOKEN
+os.environ["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+
+HF_GOLD_DATASET_REPO = "shohruhakang89/uzbekvoice-kokoro-gold-private"
+FALLBACK_DATASET_REPO = "DavronSherbaev/uzbekvoice-filtered"
+HF_PRIVATE_CKPT_REPO = "shohruhakang89/oqim-kokoro-v7-uzbek-private"
+VOCODER_REPO = "nvidia/bigvgan_v2_24khz_100band_256x"
+
+WORK_DIR = Path("/temp/oqim_kokoro_v7_work")
+GOLD_PARQUET_DIR = Path("/temp/uzbekvoice_gold_parquet")
+FALLBACK_PARQUET_DIR = Path("/temp/uzbekvoice_filtered_parquet")
+VOCODER_CACHE_DIR = Path("/temp/bigvgan_v2_cache")
+CKPT_DIR = WORK_DIR / "checkpoints"
+EVAL_DIR = WORK_DIR / "eval"
+SAMPLES_DIR = WORK_DIR / "samples"
+REF_WAV_PATH = WORK_DIR / "reference_voice_24k.wav"
+REF_ID_FILE = WORK_DIR / "ref_id.txt"
+
+for _d in [WORK_DIR, GOLD_PARQUET_DIR, VOCODER_CACHE_DIR, CKPT_DIR, EVAL_DIR, SAMPLES_DIR]:
+    _d.mkdir(parents=True, exist_ok=True)
+
+# ⭐ HAQIQIY ETALON REFERENS OVOZ (9.33s)
+REF_GDRIVE_ID = "1iuJxn5qiT1qSoVBvMDd8QKOhZnckJUtx"
+REF_TEXT = "Bugun havo juda yaxshi. Men yangi kunni yaxshi niyatlar bilan boshladim. Har bir ishda sabr va ishonch muhim."
+
+EVAL_PROMPTS = [
+    ("1. QISQA SALOM", "Assalomu alaykum! Bugun havo juda chiroyli va kayfiyatimiz a'lo darajada."),
+    ("2. O'RTA KITOB", "Kitob insonning eng yaqin do'sti, u bizga yangi olamlarni ochib beradi va fikrlashni o'rgatadi."),
+    ("3. UZUN STREAM", "O'zbekiston zamini qadimdan buyuk allomalar, shoirlar va mutafakkirlar yurti bo'lib kelgan. Bu muqaddas zamin asrlar davomida ilm-fan, madaniyat va ma'rifat rivojiga ulkan hissa qo'shgan. Imom Buxoriy, Abu Ali ibn Sino, Abu Rayhon Beruniy, Muhammad al-Xorazmiy kabi buyuk ajdodlarimizning merosi bugungi kungacha o'z qadrini yo'qotmagan."),
+]
+
+ARCH_VERSION = "oqim_kokoro_v7_6_real_data_verified"  # ⚠️ O'ZGARTIRMANG — checkpoint compat
+CODE_VERSION = "7.9.11 ULTRA-MAX FINAL"
+DATA_ORDER_VERSION = "2.0"
+ACTIVE_CFG = {"d_model": 576, "n_heads": 9, "n_enc": 6, "n_dec": 8, "ffn_mult": 2.5}
+
+# Console Image & Prosody Cloner toggles
+SHOW_IMAGES = True
+IMAGE_WIDTH = 640
+PROSODY_ENABLED = True
+PROSODY_STRENGTH = 0.80
+PROSODY_MODE = "melody"      # "melody" | "range" | "stat"
+QUALITY_GATE = True
+
+@dataclass
+class AudioTrainConfig:
+    sample_rate: int = 24000
+    n_fft: int = 1024
+    win_size: int = 1024
+    hop_size: int = 256
+    n_mels: int = 100
+    fmin: float = 0.0
+    fmax: float = 12000.0
+    mel_mean: float = -5.8
+    mel_std: float = 2.25
+    max_mel_frames: int = 560
+    min_mel_frames: int = 32
+    batch_per_gpu: int = 6
+    grad_accum: int = 2
+    lr: float = 2.0e-4
+    min_lr: float = 2.0e-5
+    weight_decay: float = 1e-2
+    warmup_steps: int = 300
+    total_steps: int = 100000
+    eval_every_steps: int = 500        # ⭐ Studio + Console namunalar har 500 qadamda
+    save_every_steps: int = 2000       # ⭐ HF + Local checkpoint har 2000 qadamda
+    console_every_steps: int = 1000    # ⭐ Console text hisobot har 1000 qadamda
+    max_speakers: int = 4096
+    min_cps: float = 7.5
+    max_cps: float = 21.0
+    min_wav_sec: float = 0.8
+    strict_attempts: int = 24
+    spk_emb_keep_prob: float = 0.12    # ⭐ 88% holatda spk_emb o'chiriladi -> spk_enc kuchli o'rganadi
+    spk_emb_scale: float = 0.04        # ⭐ spk_enc asosiy tembr/ohang manbai bo'ladi
+
+CFG = AudioTrainConfig()
+TARGET_SR = CFG.sample_rate
+N_MELS = CFG.n_mels
+HOP_SIZE = CFG.hop_size
+WIN_SIZE = CFG.win_size
+N_FFT = CFG.n_fft
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_GPUS = torch.cuda.device_count() if torch.cuda.is_available() else 0
+AMP_DTYPE = torch.float16
+USE_SCALER = DEVICE.type == "cuda"
+FPS = CFG.sample_rate / CFG.hop_size
+
+# ⭐ BOUNDARY & SMOOTH JOIN CONFIG (F5-TTS / StyleTTS2 style — zero click)
+PAUSE_SEC = {"comma": 0.22, "sent": 0.45, "ellipsis": 0.65, "soft": 0.06, "end": 0.30}
+PAD_START_FRAMES = 10
+PAD_END_FRAMES = 20
+XFADE_MS = 25
+VOC_PAD_FRAMES = 24
+JOIN_FADE_SAMP = int(CFG.sample_rate * 0.010)  # 10ms micro-taper inside room tone
+
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+
+STATE_JSON = WORK_DIR / "data_state.json"
+PROGRESS_TXT = WORK_DIR / "data_progress.txt"
+LOSS_HISTORY = {"step": [], "tot": [], "flow": [], "dur": [], "en": []}
+
+print(f"[boot] {CODE_VERSION} | torch {torch.__version__} | device {DEVICE} | n_gpu={NUM_GPUS}")
+
+def diagnose_hf_access():
+    print("=" * 78)
+    print(f"🔑 Token: {HF_TOKEN[:12]}...{HF_TOKEN[-4:]} (len={len(HF_TOKEN)})")
+    try:
+        info = whoami(token=HF_TOKEN)
+        print(f"   ✅ Egasi: {info.get('name', '?')}")
+    except Exception as e:
+        print(f"   ❌ Token: {str(e)[:150]}")
+        print("=" * 78)
+        return
+    api = HfApi(token=HF_TOKEN)
+    for rid, rtype, lbl in [
+        (HF_GOLD_DATASET_REPO, "dataset", "GOLD"),
+        (FALLBACK_DATASET_REPO, "dataset", "FALLBACK"),
+        (HF_PRIVATE_CKPT_REPO, "model", "CKPT"),
+    ]:
+        try:
+            if rtype == "dataset":
+                api.dataset_info(repo_id=rid, token=HF_TOKEN)
+            else:
+                api.model_info(repo_id=rid, token=HF_TOKEN)
+            print(f"   ✅ {lbl}: {rid}")
+        except Exception as e:
+            s = str(e)
+            if "401" in s or "unauthor" in s.lower():
+                print(f"   ❌ {lbl}: 401 UNAUTHORIZED")
+            elif "404" in s:
+                print(f"   ❌ {lbl}: 404")
+            else:
+                print(f"   ⚠️ {lbl}: {s[:100]}")
+    print("=" * 78)
+
+diagnose_hf_access()
+
+def get_hf_sample_shard_path(step):
+    s = max(1, int(step))
+    return f"samples/{((s-1)//10000+1)*10000:05d}/{((s-1)//1000+1)*1000:05d}/step_{s:06d}"
+
+# ==============================================================================
+# 3. AUDIO HELPERS, PROSODY TRANSFER v2 & QUALITY GATE
+# ==============================================================================
+def fast_sliding_rms(x, fl, hl):
+    sq = x.astype(np.float64) ** 2
+    cs = np.empty(len(sq) + 1)
+    cs[0] = 0.0
+    np.cumsum(sq, out=cs[1:])
+    if len(x) < fl:
+        return np.array([float(np.sqrt(sq.mean()))])
+    st = np.arange(0, len(x) - fl + 1, hl)
+    return np.sqrt(np.maximum(0.0, (cs[st + fl] - cs[st]) / fl))
+
+def remove_dc_offset(wav, sr=24000):
+    try:
+        b, a = scipy.signal.butter(2, 55.0 / (sr / 2), btype="high")
+        return scipy.signal.filtfilt(b, a, wav).astype(np.float32)
+    except Exception:
+        return (wav - float(np.mean(wav))).astype(np.float32)
+
+def ultra_safe_trim_silence(wav, sr=24000):
+    if wav is None or len(wav) < int(sr * 0.25):
+        return wav
+    pk = float(np.max(np.abs(wav)))
+    if pk < 1e-4:
+        return wav
+    wn = wav * (1.0 / (pk + 1e-8))
+    fl, hl = int(sr * 0.020), int(sr * 0.005)
+    if len(wn) < fl * 2:
+        return wav
+    rms = fast_sliding_rms(wn, fl, hl)
+    d = np.abs(np.diff(wn, prepend=wn[0]))
+    hf = fast_sliding_rms(d, fl, hl)
+    rt = max(0.004, float(np.percentile(rms, 8)) * 1.8)
+    ht = max(0.002, float(np.percentile(hf, 8)) * 1.8)
+    act = (rms > rt) | (hf > ht)
+    idx = np.flatnonzero(act)
+    if len(idx) == 0:
+        return wav
+    a = max(0, int(idx[0] * hl) - int(0.100 * sr))
+    b = min(len(wav), int(idx[-1] * hl) + fl + int(0.200 * sr))
+    if b - a < int(sr * 0.22):
+        return wav
+    return wav[a:b].astype(np.float32)
+
+def tail_is_abrupt(wav, sr=24000):
+    win = int(0.02 * sr)
+    if len(wav) < win * 10:
+        return False
+    rms = fast_sliding_rms(wav, win, win) + 1e-8
+    db = 20.0 * np.log10(rms)
+    return float(db[-3:].mean()) > float(np.percentile(db, 75)) - 14.0
+
+def finish_tail(wav, sr=24000):
+    out = wav.copy()
+    f = min(int(0.04 * sr), len(out) // 4)
+    if f > 8:
+        out[-f:] *= np.linspace(1.0, 0.0, f, dtype=np.float32)
+    return np.concatenate([
+        out,
+        (np.random.randn(int(0.14 * sr)) * 2e-4).astype(np.float32)
+    ]).astype(np.float32)
+
+def fast_resample_to_24k(wav, orig_sr):
+    if orig_sr == CFG.sample_rate:
+        return wav
+    if orig_sr == 16000 and CFG.sample_rate == 24000:
+        return scipy.signal.resample_poly(wav, 3, 2).astype(np.float32)
+    g = math.gcd(orig_sr, CFG.sample_rate)
+    up, down = CFG.sample_rate // g, orig_sr // g
+    if up <= 64 and down <= 64:
+        return scipy.signal.resample_poly(wav, up, down).astype(np.float32)
+    return librosa.resample(wav, orig_sr=orig_sr, target_sr=CFG.sample_rate).astype(np.float32)
+
+def _safe_xfade(a, b, n):
+    """⭐ Silliq equal-power crossfade (room-tone ichida, micro-taper bilan)."""
+    a = np.asarray(a, dtype=np.float32)
+    b = np.asarray(b, dtype=np.float32)
+    if len(a) == 0:
+        return b
+    if len(b) == 0:
+        return a
+    tap = min(JOIN_FADE_SAMP, len(a) // 8, len(b) // 8)
+    if tap > 4:
+        a = a.copy()
+        b = b.copy()
+        a[-tap:] *= np.linspace(1.0, 0.25, tap, dtype=np.float32)
+        b[:tap] *= np.linspace(0.25, 1.0, tap, dtype=np.float32)
+    n_eff = min(int(n), len(a) // 3, len(b) // 3)
+    if n_eff <= 4:
+        return np.concatenate([a, b]).astype(np.float32)
+    th = np.linspace(0.0, np.pi * 0.5, n_eff, dtype=np.float32)
+    ov = a[-n_eff:] * np.cos(th) + b[:n_eff] * np.sin(th)
+    return np.concatenate([a[:-n_eff], ov, b[n_eff:]]).astype(np.float32)
+
+def postprocess_wav(w, sr=24000):
+    """⭐ TOZA POSTPROCESS: tanh siqish YO'Q, EQ YO'Q, click-interpolatsiya YO'Q."""
+    if w is None or len(w) < 100:
+        return w if w is not None else np.zeros(int(0.1 * sr), dtype=np.float32)
+    w = np.asarray(w, dtype=np.float32)
+    w = w - float(np.mean(w))
+    pk = float(np.max(np.abs(w)))
+    if pk > 1e-6:
+        w = w * (0.90 / pk)
+    fi = min(int(0.035 * sr), len(w) // 6)
+    if fi > 8:
+        ramp = np.linspace(0.0, 1.0, fi, dtype=np.float32)
+        w[:fi] *= ramp
+        w[-fi:] *= ramp[::-1]
+    return np.clip(w, -0.99, 0.99).astype(np.float32)
+
+def _q_score(w, sr=24000):
+    """Audio tozalik balli (xirillash yoki click bo'lsa ball tushadi)."""
+    w = np.asarray(w, dtype=np.float32).reshape(-1)
+    if len(w) < int(0.15 * sr) or not np.isfinite(w).all():
+        return 0.0
+    rms = float(np.sqrt(np.mean(w * w) + 1e-12))
+    pk = float(np.max(np.abs(w)) + 1e-12)
+    d2 = np.abs(np.diff(w, n=2))
+    med = float(np.median(d2) + 1e-7)
+    clicks = int(np.sum(d2 > (med * 40.0 + 1e-4)))
+    zc = float(np.mean(w[:-1] * w[1:] < 0))
+    s = min(rms / 0.05, 1.0) * 40.0 + 10.0
+    if pk >= 0.995:
+        s -= 6.0
+    s -= min(clicks, 3000) * 0.01
+    s -= max(0.0, zc - 0.30) * 40.0
+    return float(max(0.0, s))
+
+def _smooth1d(x, k=9):
+    x = np.asarray(x, dtype=np.float32)
+    if len(x) < k or k <= 1:
+        return x
+    win = np.hanning(k).astype(np.float32)
+    win /= win.sum() + 1e-8
+    return np.convolve(x, win, mode="same").astype(np.float32)
+
+def _f0_track(y, sr=24000):
+    y = np.asarray(y, dtype=np.float32)
+    try:
+        f0, _, _ = librosa.pyin(
+            y, fmin=60.0, fmax=420.0, sr=sr,
+            frame_length=1024, hop_length=256, fill_na=0.0
+        )
+        return np.nan_to_num(f0, nan=0.0).astype(np.float32)
+    except Exception:
+        return np.zeros(max(1, len(y) // 256), dtype=np.float32)
+
+def transfer_prosody(out_wav, ref_wav, sr=24000, strength=0.80, mode="melody"):
+    """
+    ⭐ PROSODY TRANSFER v2:
+    - Faqat unli (voiced) segmentlarda F0 kontur va diapazonni ko'chiradi (shovqinsiz).
+    - Energiya dinamikasini yumshoq moslaydi.
+    """
+    w = np.asarray(out_wav, dtype=np.float32).reshape(-1)
+    r = np.asarray(ref_wav, dtype=np.float32).reshape(-1)
+    if len(w) < int(0.35 * sr) or len(r) < int(0.35 * sr) or strength <= 0.01:
+        return postprocess_wav(w, sr)
+    try:
+        f0_o = _f0_track(w, sr)
+        f0_r = _f0_track(r, sr)
+        vo = f0_o > 60.0
+        vr = f0_r > 60.0
+        if int(vo.sum()) < 8 or int(vr.sum()) < 8:
+            return postprocess_wav(w, sr)
+
+        lo = np.log2(np.maximum(f0_o[vo], 60.0))
+        lr = np.log2(np.maximum(f0_r[vr], 60.0))
+        med_o, med_r = float(np.median(lo)), float(np.median(lr))
+        std_o = max(float(np.std(lo)), 0.04)
+        std_r = max(float(np.std(lr)), 0.04)
+        spread = float(np.clip(std_r / std_o, 0.85, 1.55))
+
+        dev_o = np.zeros_like(f0_o, dtype=np.float32)
+        dev_o[vo] = np.log2(f0_o[vo]) - med_o
+        dev_o = _smooth1d(dev_o, k=9)
+
+        dev_r_v = _smooth1d(lr - med_r, k=9)
+        dev_r_interp = np.interp(
+            np.linspace(0.0, 1.0, len(f0_o)),
+            np.linspace(0.0, 1.0, len(dev_r_v)),
+            dev_r_v
+        ).astype(np.float32)
+
+        if mode == "melody":
+            wm = 0.55 * float(strength)
+            tgt_dev = (1.0 - wm) * dev_o + wm * dev_r_interp
+            tgt_dev = tgt_dev * (1.0 + 0.25 * float(strength) * (spread - 1.0))
+        elif mode == "range":
+            tgt_dev = dev_o * (1.0 + float(strength) * (spread - 1.0))
+        else:
+            tgt_dev = dev_o * (1.0 + 0.35 * float(strength))
+
+        g_shift = float(np.clip(med_r - med_o, -0.35, 0.35)) * 0.25 * float(strength)
+        delta_st = _smooth1d((tgt_dev - dev_o + g_shift) * 12.0, k=11)
+        delta_st = np.clip(delta_st, -2.2, 2.2)
+
+        seg = int(0.16 * sr)
+        hop = int(0.08 * sr)
+        if len(w) < seg * 2:
+            return postprocess_wav(w, sr)
+
+        out = np.zeros_like(w, dtype=np.float32)
+        wsum = np.zeros_like(w, dtype=np.float32)
+        win = np.hanning(seg).astype(np.float32)
+
+        for st_idx in range(0, len(w) - seg + 1, hop):
+            ed_idx = st_idx + seg
+            f_a = int(st_idx / 256)
+            f_b = max(f_a + 1, int(ed_idx / 256))
+            v_slice = vo[f_a:f_b]
+            if len(v_slice) > 0 and float(np.mean(v_slice)) >= 0.45:
+                st_val = float(np.mean(delta_st[f_a:f_b]))
+            else:
+                st_val = 0.0
+            chunk = w[st_idx:ed_idx]
+            if abs(st_val) >= 0.12:
+                try:
+                    shifted = librosa.effects.pitch_shift(
+                        chunk, sr=sr, n_steps=st_val, bins_per_octave=12
+                    ).astype(np.float32)
+                    if len(shifted) == seg:
+                        chunk = shifted
+                except Exception:
+                    pass
+            out[st_idx:ed_idx] += chunk * win
+            wsum[st_idx:ed_idx] += win
+
+        rem = len(w) - ((len(w) - seg) // hop) * hop
+        if rem > 0:
+            tail_s = len(w) - seg
+            if tail_s >= 0:
+                out[tail_s:] += w[tail_s:] * win
+                wsum[tail_s:] += win
+
+        m_valid = wsum > 1e-4
+        y_res = w.copy()
+        y_res[m_valid] = out[m_valid] / wsum[m_valid]
+
+        # Dynamic energy envelope alignment
+        fl, hl = int(0.03 * sr), int(0.01 * sr)
+        ro = fast_sliding_rms(y_res, fl, hl) + 1e-6
+        rr = fast_sliding_rms(r, fl, hl) + 1e-6
+        so_ = float(np.std(np.log(ro)))
+        sr_ = float(np.std(np.log(rr)))
+        if so_ > 1e-3 and sr_ > 1e-3:
+            k_en = 1.0 + 0.35 * float(strength) * (float(np.clip(sr_ / so_, 0.82, 1.28)) - 1.0)
+            log_ro = np.log(ro)
+            med_lro = float(np.median(log_ro))
+            gain_env = np.exp(np.clip((log_ro - med_lro) * (k_en - 1.0), -0.25, 0.25))
+            gain_env = _smooth1d(gain_env, k=15)
+            gain_samp = np.interp(
+                np.arange(len(y_res)),
+                np.linspace(0, len(y_res) - 1, len(gain_env)),
+                gain_env
+            ).astype(np.float32)
+            y_res = y_res * gain_samp
+
+        return postprocess_wav(y_res, sr)
+    except Exception:
+        return postprocess_wav(w, sr)
+
+# ==============================================================================
+# 4. NUMBA VITERBI MONOTONIC ALIGNMENT
+# ==============================================================================
+if HAS_NUMBA:
+    @njit(nogil=True, cache=True)
+    def _numba_viterbi_batch(dist_all, tok_lens, mel_lens):
+        B, T_tok, T_mel = dist_all.shape
+        durs = np.zeros((B, T_tok), dtype=np.float32)
+        for b in range(B):
+            N, M = int(tok_lens[b]), int(mel_lens[b])
+            if N <= 1 or M <= N:
+                if M >= N:
+                    for i in range(N - 1):
+                        durs[b, i] = 1.0
+                    durs[b, N - 1] = float(M - (N - 1))
+                else:
+                    for i in range(M):
+                        durs[b, i] = 1.0
+                continue
+            dp = np.full((N, M), 1e9, dtype=np.float32)
+            ptr = np.zeros((N, M), dtype=np.int32)
+            mi = max(1, min(M - N + 1, 32))
+            run = 0.0
+            for j in range(mi):
+                run += dist_all[b, 0, j]
+                dp[0, j] = run
+            for j in range(1, M):
+                i_min = max(1, N - (M - j))
+                i_max = min(N, j + 1)
+                for i in range(i_min, i_max):
+                    stay = dp[i, j - 1]
+                    move = dp[i - 1, j - 1]
+                    if move <= stay:
+                        dp[i, j] = dist_all[b, i, j] + move
+                        ptr[i, j] = i - 1
+                    else:
+                        dp[i, j] = dist_all[b, i, j] + stay
+                        ptr[i, j] = i
+            ti = N - 1
+            for j in range(M - 1, -1, -1):
+                durs[b, ti] += 1.0
+                ti = ptr[ti, j]
+            s = durs[b].sum()
+            if s < M:
+                durs[b, N - 1] += float(M - s)
+        return durs
+else:
+    def _numba_viterbi_batch(dist_all, tok_lens, mel_lens):
+        B, T_tok, T_mel = dist_all.shape
+        durs = np.zeros((B, T_tok), dtype=np.float32)
+        for b in range(B):
+            N, M = int(tok_lens[b]), int(mel_lens[b])
+            if N <= 1 or M <= N:
+                if M >= N:
+                    durs[b, :N-1] = 1.0
+                    durs[b, N-1] = float(M - N + 1)
+                else:
+                    durs[b, :M] = 1.0
+                continue
+            cost = dist_all[b, :N, :M]
+            dp = np.full((N, M), 1e9, dtype=np.float32)
+            ptr = np.zeros((N, M), dtype=np.int32)
+            mi = max(1, min(M - N + 1, 32))
+            dp[0, :mi] = np.cumsum(cost[0, :mi])
+            for j in range(1, M):
+                stay = dp[1:N, j-1]
+                move = dp[0:N-1, j-1]
+                cond = move <= stay
+                dp[1:N, j] = cost[1:N, j] + np.where(cond, move, stay)
+                ptr[1:N, j] = np.where(
+                    cond,
+                    np.arange(0, N-1, dtype=np.int32),
+                    np.arange(1, N, dtype=np.int32)
+                )
+            ti = N - 1
+            for j in range(M - 1, -1, -1):
+                durs[b, ti] += 1.0
+                ti = int(ptr[ti, j])
+            s = durs[b].sum()
+            if s < M:
+                durs[b, N-1] += float(M - s)
+        return durs
+
+_ = _numba_viterbi_batch(
+    np.zeros((1, 4, 8), dtype=np.float32),
+    np.array([4]),
+    np.array([8])
+)
+
+# ==============================================================================
+# 5. UZBEK PHONEME TOKENIZER
+# ==============================================================================
+ONES = ["", "bir", "ikki", "uch", "to'rt", "besh", "olti", "yetti", "sakkiz", "to'qqiz"]
+TENS = ["", "o'n", "yigirma", "o'ttiz", "qirq", "ellik", "oltmish", "yetmish", "sakson", "to'qson"]
+CYR = {
+    "а":"a","б":"b","в":"v","г":"g","ғ":"g'","д":"d","е":"e","ё":"yo","ж":"j","з":"z",
+    "и":"i","й":"y","к":"k","қ":"q","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r",
+    "с":"s","т":"t","у":"u","ў":"o'","ф":"f","х":"x","ҳ":"h","ц":"ts","ч":"ch","ш":"sh",
+    "щ":"sh","ъ":"'","ь":"","э":"e","ю":"yu","я":"ya"
+}
+
+def _num_to_uz(n):
+    if n == 0:
+        return "nol"
+    if n < 0:
+        return "minus " + _num_to_uz(-n)
+    p = []
+    for v, w in [(10**9, "milliard"), (10**6, "million"), (1000, "ming")]:
+        if n >= v:
+            p.append(_num_to_uz(n // v) + " " + w)
+            n %= v
+    if n >= 100:
+        h = n // 100
+        p.append((ONES[h] + " " if h > 1 else "") + "yuz")
+        n %= 100
+    if n >= 10:
+        p.append(TENS[n // 10])
+        n %= 10
+    if n > 0:
+        p.append(ONES[n])
+    return " ".join(x for x in p if x).strip()
+
+class UzbekPhonemeTokenizer:
+    def __init__(self):
+        self.pad_id, self.bos_id, self.eos_id = 0, 1, 2
+        self.sp = ["<pad>", "<bos>", "<eos>", " ", ",", ".", "!", "?", "-", ":", ";"]
+        self.multi = ["o'", "g'", "sh", "ch", "ng"]
+        self.single = list("abdefghijklmnopqrstuvxyz'c")
+        self.vocab = self.sp + self.multi + self.single
+        self.tok2id = {t: i for i, t in enumerate(self.vocab)}
+        self.id2tok = {i: t for i, t in enumerate(self.vocab)}
+        self.vocab_size = len(self.vocab)
+
+    def normalize_text(self, text):
+        if not isinstance(text, str):
+            return ""
+        t = text.lower().strip()
+        for a in ["\u2018", "\u2019", "`", "\u02bc", "\u02bb", "\u00b4", "\u02b9", "\u02bd", "\u02c8"]:
+            t = t.replace(a, "'")
+        if any("а" <= c <= "я" or c in "ўғқҳё" for c in t):
+            t = "".join(CYR.get(c, c) for c in t)
+        t = re.sub(
+            r"\d+",
+            lambda m: _num_to_uz(int(m.group(0))) if len(m.group(0)) <= 12 else m.group(0),
+            t
+        )
+        t = re.sub(r"[^a-z'.,!?\-:; ]+", " ", t)
+        return re.sub(r"\s+", " ", t).strip()
+
+    def encode_body(self, text):
+        t = self.normalize_text(text)
+        ids = []
+        i = 0
+        n = len(t)
+        while i < n:
+            hit = False
+            for mg in self.multi:
+                if t.startswith(mg, i):
+                    ids.append(self.tok2id[mg])
+                    i += len(mg)
+                    hit = True
+                    break
+            if not hit:
+                c = t[i]
+                if c in self.tok2id:
+                    ids.append(self.tok2id[c])
+                i += 1
+        return ids
+
+    def encode(self, text):
+        return [self.bos_id] + self.encode_body(text) + [self.eos_id]
+
+    def decode(self, ids):
+        out = []
+        for x in ids:
+            xi = int(x)
+            if xi in (self.pad_id, self.bos_id, self.eos_id):
+                continue
+            out.append(self.id2tok.get(xi, ""))
+        return "".join(out).strip()
+
+TOKENIZER = UzbekPhonemeTokenizer()
+
+# ==============================================================================
+# 6. BIGVGAN-V2 24kHz VOCODER & MEL EXTRACTOR (ZERO IMPORT ERRORS)
+# ==============================================================================
+class BigVGANMelExtractor(nn.Module):
+    def __init__(self, cfg=None):
+        super().__init__()
+        self.cfg = cfg if cfg is not None else CFG
+        mb = librosa.filters.mel(
+            sr=self.cfg.sample_rate, n_fft=self.cfg.n_fft,
+            n_mels=self.cfg.n_mels, fmin=self.cfg.fmin, fmax=self.cfg.fmax
+        )
+        self.register_buffer("mel_basis", torch.from_numpy(mb).float())
+        self.register_buffer("hann_window", torch.hann_window(self.cfg.win_size).float())
+
+    @torch.no_grad()
+    def forward(self, wav):
+        with _autocast(enabled=False):
+            w = wav.float()
+            if w.dim() == 1:
+                w = w.unsqueeze(0)
+            pad = (self.cfg.n_fft - self.cfg.hop_size) // 2
+            pm = "reflect" if w.size(-1) > pad * 2 else "constant"
+            wp = F.pad(w.unsqueeze(1), (pad, pad), mode=pm).squeeze(1)
+            spec = torch.stft(
+                wp, n_fft=self.cfg.n_fft, hop_length=self.cfg.hop_size,
+                win_length=self.cfg.win_size, window=self.hann_window,
+                center=False, return_complex=True
+            )
+            mag = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-9)
+            return torch.log(torch.clamp(torch.matmul(self.mel_basis, mag), min=1e-5))
+
+    def normalize(self, m):
+        return (m - self.cfg.mel_mean) / self.cfg.mel_std
+
+    def denormalize(self, m):
+        return m * self.cfg.mel_std + self.cfg.mel_mean
+
+def load_bigvgan_vocoder(cache, device):
+    print("⏳ BigVGAN-v2 24kHz yuklanmoqda...")
+    cache = Path(cache)
+    cache.mkdir(parents=True, exist_ok=True)
+    (cache / "alias_free_activation" / "torch").mkdir(parents=True, exist_ok=True)
+
+    for rf in [
+        "config.json", "bigvgan_generator.pt", "bigvgan.py", "activations.py",
+        "alias_free_activation/torch/act.py",
+        "alias_free_activation/torch/filter.py",
+        "alias_free_activation/torch/resample.py"
+    ]:
+        t = cache / rf
+        if not t.exists():
+            hf_hub_download(repo_id=VOCODER_REPO, filename=rf, local_dir=str(cache), token=HF_TOKEN)
+
+    # ⭐ Yordamchi modullarni har doim yozamiz ("No module named 'utils'" hech qachon chiqmaydi)
+    (cache / "alias_free_activation" / "__init__.py").write_text("")
+    (cache / "alias_free_activation" / "torch" / "__init__.py").write_text("from .act import Activation1d\n")
+    (cache / "env.py").write_text(
+        "class AttrDict(dict):\n"
+        "    def __init__(self, *a, **k):\n"
+        "        super().__init__(*a, **k)\n"
+        "        self.__dict__ = self\n"
+    )
+    (cache / "utils.py").write_text(
+        "import torch.nn as nn\n"
+        "def init_weights(m, mean=0.0, std=0.01):\n"
+        "    if 'Conv' in m.__class__.__name__:\n"
+        "        m.weight.data.normal_(mean, std)\n"
+        "def get_padding(k, d=1):\n"
+        "    return int((k * d - d) / 2)\n"
+    )
+    (cache / "meldataset.py").write_text("")
+
+    if str(cache) in sys.path:
+        sys.path.remove(str(cache))
+    sys.path.insert(0, str(cache))
+    for m in ["utils", "env", "meldataset", "activations", "bigvgan"]:
+        if m in sys.modules:
+            del sys.modules[m]
+
+    from env import AttrDict
+    import bigvgan as bvg
+    with open(cache / "config.json") as f:
+        h = AttrDict(json.load(f))
+    voc = bvg.BigVGAN(h, use_cuda_kernel=False)
+    ck = torch.load(cache / "bigvgan_generator.pt", map_location="cpu", weights_only=False)
+    voc.load_state_dict(ck.get("generator", ck), strict=False)
+    voc.remove_weight_norm()
+    voc.eval().to(device)
+    for p in voc.parameters():
+        p.requires_grad = False
+    print("[vocoder] ✅ BigVGAN-v2 24kHz tayyor")
+    return voc
+
+MEL_EXTRACTOR = BigVGANMelExtractor(CFG).to(DEVICE)
+VOCODER = load_bigvgan_vocoder(VOCODER_CACHE_DIR, DEVICE)
+
+@torch.no_grad()
+def vocode_mel_to_wav(norm_mel, fade_out=False, left_ctx_mel=None, right_ctx_mel=None,
+                      room_mel=None, auto_pad=VOC_PAD_FRAMES):
+    """⭐ Room-tone va reflected mel padding — DC silliq, xirillash yo'q."""
+    with _autocast(enabled=False):
+        x = norm_mel.detach().float().to(DEVICE)
+        if x.dim() == 3:
+            x = x.squeeze(0)
+        if x.size(-1) != CFG.n_mels and x.size(0) == CFG.n_mels:
+            x = x.transpose(0, 1)
+        if x.size(0) < 1:
+            return np.zeros(int(0.1 * CFG.sample_rate), dtype=np.float32)
+
+        n_l = n_r = 0
+        parts = []
+
+        if left_ctx_mel is not None and left_ctx_mel.numel() > 0:
+            lc = left_ctx_mel.detach().float().to(DEVICE)
+            if lc.dim() == 3:
+                lc = lc.squeeze(0)
+            if lc.size(-1) != CFG.n_mels and lc.size(0) == CFG.n_mels:
+                lc = lc.transpose(0, 1)
+            n_l = lc.size(0)
+            parts.append(lc)
+        elif auto_pad > 0:
+            if room_mel is not None:
+                rm = room_mel.detach().float().to(DEVICE)
+                if rm.dim() == 1:
+                    pad = rm.unsqueeze(0).expand(auto_pad, -1).clone()
+                else:
+                    if rm.size(-1) != CFG.n_mels:
+                        rm = rm.transpose(0, 1)
+                    k = min(auto_pad, rm.size(0))
+                    pad = rm[:k]
+                    if pad.size(0) < auto_pad:
+                        pad = pad.repeat(auto_pad // k + 1, 1)[:auto_pad]
+            else:
+                n = min(auto_pad, max(1, x.size(0) - 1))
+                pad = x[1:n+1].flip(0) if x.size(0) > 2 else x[:1].expand(auto_pad, -1).clone()
+                if pad.size(0) < auto_pad:
+                    pad = pad.repeat(auto_pad // max(1, pad.size(0)) + 1, 1)[:auto_pad]
+            n_l = auto_pad
+            parts.append(pad)
+
+        parts.append(x)
+
+        if right_ctx_mel is not None and right_ctx_mel.numel() > 0:
+            rc = right_ctx_mel.detach().float().to(DEVICE)
+            if rc.dim() == 3:
+                rc = rc.squeeze(0)
+            if rc.size(-1) != CFG.n_mels and rc.size(0) == CFG.n_mels:
+                rc = rc.transpose(0, 1)
+            n_r = rc.size(0)
+            parts.append(rc)
+        elif auto_pad > 0:
+            if room_mel is not None:
+                rm = room_mel.detach().float().to(DEVICE)
+                if rm.dim() == 1:
+                    pad = rm.unsqueeze(0).expand(auto_pad, -1).clone()
+                else:
+                    if rm.size(-1) != CFG.n_mels:
+                        rm = rm.transpose(0, 1)
+                    k = min(auto_pad, rm.size(0))
+                    pad = rm[-k:]
+                    if pad.size(0) < auto_pad:
+                        pad = pad.repeat(auto_pad // k + 1, 1)[:auto_pad]
+            else:
+                n = min(auto_pad, max(1, x.size(0) - 1))
+                pad = x[-n-1:-1].flip(0) if x.size(0) > 2 else x[-1:].expand(auto_pad, -1).clone()
+                if pad.size(0) < auto_pad:
+                    pad = pad.repeat(auto_pad // max(1, pad.size(0)) + 1, 1)[:auto_pad]
+            n_r = auto_pad
+            parts.append(pad)
+
+        full = torch.cat(parts, 0)
+        mi = full.transpose(0, 1).unsqueeze(0).contiguous()
+        if not torch.isfinite(mi).all():
+            return np.zeros(int(0.1 * CFG.sample_rate), dtype=np.float32)
+
+        wav = VOCODER(MEL_EXTRACTOR.denormalize(mi)).squeeze().clamp(-0.99, 0.99)
+        wn = wav.detach().cpu().numpy().astype(np.float32)
+
+        if n_l > 0:
+            wn = wn[n_l * CFG.hop_size:]
+        if n_r > 0 and len(wn) > n_r * CFG.hop_size:
+            wn = wn[:len(wn) - n_r * CFG.hop_size]
+
+    wn = wn - float(np.mean(wn))
+    if fade_out:
+        fl = int(0.025 * CFG.sample_rate)
+        if len(wn) > fl * 2:
+            wn[-fl:] *= 0.5 * (1.0 + np.cos(np.pi * np.linspace(0, 1, fl, dtype=np.float32)))
+    return wn
+
+# ==============================================================================
+# 7. REFERENCE VOICE PREPARATION & CONSOLE SPECTROGRAM RENDERER
+# ==============================================================================
+def _synthetic_ref_wav(sr=24000, dur=3.0):
+    n = int(sr * dur)
+    t = np.linspace(0, dur, n, dtype=np.float32)
+    f0 = 145.0 + 12.0 * np.sin(2 * np.pi * 4.5 * t)
+    ph = 2 * np.pi * np.cumsum(f0) / sr
+    gl = sum((1.0 / k) * np.sin(k * ph) for k in range(1, 12))
+    from scipy.signal import butter, filtfilt
+    def band(x, fc, bw):
+        ny = sr / 2
+        lo = max(0.01, (fc - bw / 2) / ny)
+        hi = min(0.99, (fc + bw / 2) / ny)
+        if lo >= hi - 0.01:
+            return x
+        b, a = butter(2, [lo, hi], "band")
+        return filtfilt(b, a, x)
+    sig = band(gl, 730, 90) + 0.7 * band(gl, 1090, 110) + 0.4 * band(gl, 2440, 140)
+    w = (sig * np.sin(np.pi * t / dur) ** 0.35).astype(np.float32)
+    return w / (np.max(np.abs(w)) + 1e-8) * 0.72
+
+def prepare_reference_voice():
+    cached_id = REF_ID_FILE.read_text().strip() if REF_ID_FILE.exists() else ""
+    need_dl = (not REF_WAV_PATH.exists()) or (cached_id != REF_GDRIVE_ID)
+    if need_dl:
+        raw = WORK_DIR / "ref_raw_dl.wav"
+        try:
+            import gdown
+            print(f"[ref] Google Drive'dan yuklanmoqda ({REF_GDRIVE_ID[:12]}...)...")
+            gdown.download(id=REF_GDRIVE_ID, output=str(raw), quiet=True)
+            if raw.exists() and raw.stat().st_size > 1000:
+                w, _ = librosa.load(str(raw), sr=CFG.sample_rate, mono=True)
+                w = remove_dc_offset(ultra_safe_trim_silence(w, CFG.sample_rate))
+                w = w / (np.max(np.abs(w)) + 1e-8) * 0.92
+                sf.write(str(REF_WAV_PATH), w, CFG.sample_rate)
+                REF_ID_FILE.write_text(REF_GDRIVE_ID)
+                print(f"[ref] ✅ Haqiqiy etalon referens saqlandi ({len(w)/CFG.sample_rate:.2f}s)")
+        except Exception as e:
+            print(f"⚠️ GDrive referens xato ({e}) — formant-sintez fallback")
+            if not REF_WAV_PATH.exists():
+                sf.write(str(REF_WAV_PATH), _synthetic_ref_wav(CFG.sample_rate, 3.0), CFG.sample_rate)
+    w, _ = librosa.load(str(REF_WAV_PATH), sr=CFG.sample_rate, mono=True)
+    w = ultra_safe_trim_silence(w, CFG.sample_rate)
+    lm = MEL_EXTRACTOR(torch.from_numpy(w).unsqueeze(0).to(DEVICE))
+    nm = MEL_EXTRACTOR.normalize(lm).squeeze(0).transpose(0, 1).contiguous()
+    print(f"[ref] tayyor: {len(w)/CFG.sample_rate:.2f}s | mel={tuple(nm.shape)}")
+    return w, nm
+
+REF_WAV_NP, REF_MEL_NORM = prepare_reference_voice()
+
+def save_audio_png(wav, mel_norm, out_png, title="Audio", ref_mel=None):
+    """⭐ 3-panelli spektrogramma rasmi (Waveform + Mel + Reference Mel)."""
+    try:
+        w = np.asarray(wav, dtype=np.float32).reshape(-1)
+        dur = len(w) / CFG.sample_rate
+        m = mel_norm.detach().float().cpu() if torch.is_tensor(mel_norm) else torch.tensor(mel_norm).float()
+        if m.dim() == 3:
+            m = m.squeeze(0)
+        if m.size(-1) == CFG.n_mels:
+            m_np = MEL_EXTRACTOR.denormalize(m).numpy().T
+        else:
+            m_np = MEL_EXTRACTOR.denormalize(m).numpy()
+
+        n_rows = 3 if ref_mel is not None else 2
+        fig, axes = plt.subplots(n_rows, 1, figsize=(10.2, 2.1 * n_rows), dpi=130)
+        fig.patch.set_facecolor("#0e0e12")
+
+        t_axis = np.linspace(0, max(dur, 1e-3), len(w))
+        axes[0].set_facecolor("#0e0e12")
+        axes[0].plot(t_axis, w, color="#4fd1c5", lw=0.65)
+        axes[0].set_xlim(0, max(dur, 1e-3))
+        axes[0].set_ylim(-1.02, 1.02)
+        axes[0].set_title(f"{title}  |  {dur:.2f}s  |  peak={float(np.max(np.abs(w))):.3f}",
+                          color="#e2e8f0", fontsize=9.5, fontweight="bold")
+        axes[0].tick_params(colors="#94a3b8", labelsize=7.5)
+
+        axes[1].set_facecolor("#0e0e12")
+        axes[1].imshow(m_np, aspect="auto", origin="lower", cmap="magma", vmin=-11.0, vmax=-0.2)
+        axes[1].set_ylabel("Sintez Mel", color="#94a3b8", fontsize=8)
+        axes[1].tick_params(colors="#94a3b8", labelsize=7.5)
+
+        if ref_mel is not None:
+            rm = ref_mel.detach().float().cpu() if torch.is_tensor(ref_mel) else torch.tensor(ref_mel).float()
+            if rm.dim() == 3:
+                rm = rm.squeeze(0)
+            rm_np = MEL_EXTRACTOR.denormalize(rm).numpy().T if rm.size(-1) == CFG.n_mels else MEL_EXTRACTOR.denormalize(rm).numpy()
+            axes[2].set_facecolor("#0e0e12")
+            axes[2].imshow(rm_np, aspect="auto", origin="lower", cmap="viridis", vmin=-11.0, vmax=-0.2)
+            axes[2].set_ylabel("Etalon Mel", color="#94a3b8", fontsize=8)
+            axes[2].tick_params(colors="#94a3b8", labelsize=7.5)
+
+        for ax in axes:
+            for sp in ax.spines.values():
+                sp.set_color("#1e293b")
+        plt.tight_layout(pad=0.45)
+        out_png = Path(out_png)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_png, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        return out_png
+    except Exception as e:
+        print(f"[img] xato: {e}")
+        return None
+
+def save_curve_png(hist, out_png, title="OQIM-KOKORO Loss Curve"):
+    if not hist["step"]:
+        return None
+    try:
+        fig, ax = plt.subplots(figsize=(9.6, 2.8), dpi=130)
+        fig.patch.set_facecolor("#0e0e12")
+        ax.set_facecolor("#0e0e12")
+        st = hist["step"]
+        for k, col, lbl in [
+            ("tot", "#4fd1c5", "TOTAL"),
+            ("flow", "#f6ad55", "FLOW+PRIOR"),
+            ("dur", "#9f7aea", "DUR"),
+            ("en", "#68d391", "ENERGY"),
+        ]:
+            if hist.get(k):
+                ax.plot(st, hist[k], color=col, lw=1.6, label=f"{lbl} ({hist[k][-1]:.4f})")
+        ax.set_title(title, color="#e2e8f0", fontsize=9.5, fontweight="bold")
+        ax.legend(facecolor="#161b26", edgecolor="#2d3748", labelcolor="#e2e8f0", fontsize=8)
+        ax.tick_params(colors="#94a3b8", labelsize=8)
+        ax.grid(True, color="#1e293b", alpha=0.5, lw=0.6)
+        for sp in ax.spines.values():
+            sp.set_color("#1e293b")
+        plt.tight_layout(pad=0.4)
+        out_png = Path(out_png)
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(out_png, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        return out_png
+    except Exception:
+        return None
+
+def show_png(path, width=IMAGE_WIDTH):
+    if path is None or not Path(path).exists():
+        return
+    try:
+        display(IPyImage(filename=str(path), width=width))
+    except Exception:
+        print(f"[img] {path}")
+
+if SHOW_IMAGES:
+    _ref_png = save_audio_png(
+        REF_WAV_NP, REF_MEL_NORM, WORK_DIR / "reference_voice.png",
+        title="ETALON REFERENS OVOZ (24kHz)"
+    )
+    show_png(_ref_png, width=IMAGE_WIDTH)
+
+# ==============================================================================
+# 8. DATASET & RESUMABLE BLOCK SAMPLER
+# ==============================================================================
+def _try_fetch_gold():
+    for att in range(1, 4):
+        try:
+            print(f"📥 Gold dataset: {HF_GOLD_DATASET_REPO} (urinish {att}/3)...")
+            snapshot_download(
+                repo_id=HF_GOLD_DATASET_REPO, repo_type="dataset",
+                local_dir=str(GOLD_PARQUET_DIR), token=HF_TOKEN, max_workers=4
+            )
+            g = sorted(GOLD_PARQUET_DIR.rglob("*.parquet"))
+            if g:
+                print(f"✅ Gold: {len(g)} shard")
+                return [str(p) for p in g]
+            print("⚠️ .parquet topilmadi → retry")
+        except Exception as e:
+            s = str(e)
+            if "401" in s or "unauthor" in s.lower():
+                print("❌ 401 UNAUTHORIZED")
+                return []
+            print(f"⚠️ Urinish {att}: {s[:150]}")
+            if att < 3:
+                time.sleep(2)
+    return []
+
+def ensure_dataset_shards():
+    local = sorted(GOLD_PARQUET_DIR.rglob("*.parquet"))
+    if local:
+        print(f"✅ Lokal Gold: {len(local)} shard")
+        return [str(p) for p in local]
+    if HF_TOKEN:
+        g = _try_fetch_gold()
+        if g:
+            return g
+    print(f"📥 Fallback: {FALLBACK_DATASET_REPO}...")
+    FALLBACK_PARQUET_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=FALLBACK_DATASET_REPO, repo_type="dataset",
+        local_dir=str(FALLBACK_PARQUET_DIR),
+        token=HF_TOKEN if HF_TOKEN else None
+    )
+    fb = sorted(FALLBACK_PARQUET_DIR.rglob("*.parquet"))
+    print(f"✅ Fallback: {len(fb)} shard")
+    return [str(p) for p in fb]
+
+def _worker_init(wid):
+    np.random.seed(42 + wid)
+    random.seed(42 + wid)
+
+class UzbekZeroCopyShardDataset(Dataset):
+    TEXT_COLS = ["text", "sentence", "transcript", "transcription", "normalized_text", "norm_text", "utt", "caption"]
+    AUDIO_COLS = ["audio", "wav", "audio_bytes", "speech", "sound"]
+
+    def __init__(self, shard_paths, cache_size=2):
+        self.shard_paths = list(shard_paths)
+        rows = []
+        for p in self.shard_paths:
+            try:
+                rows.append(int(pq.ParquetFile(p).metadata.num_rows))
+            except Exception:
+                print(f"⚠️ Shard skip: {Path(p).name}")
+                rows.append(0)
+        self.row_counts = rows
+        self._offsets = np.concatenate([[0], np.cumsum(rows)]).astype(np.int64)
+        self._offsets_list = self._offsets.tolist()
+        self.total_rows = int(self._offsets[-1])
+        if self.total_rows <= 0:
+            raise RuntimeError("Datasetda qator yo'q!")
+        sig = "|".join(f"{Path(p).name}:{n}" for p, n in zip(self.shard_paths, rows))
+        self.sig = f"{zlib.crc32(sig.encode()):08x}"
+        self.cache_size = max(1, int(cache_size))
+        self._cache = {}
+        self._order = []
+        self._cols_cache = {}
+        self.cached_table = None
+        self.cached_cols = set()
+        self.cached_shard_idx = -1
+        self.cached_num_rows = 0
+        self.last_valid_sample = None
+        try:
+            self._stats = mp.Array("q", 4)
+        except Exception:
+            self._stats = None
+
+    def __len__(self):
+        return self.total_rows
+
+    def _bump(self, i, v=1):
+        if self._stats is None:
+            return
+        try:
+            with self._stats.get_lock():
+                self._stats[i] += v
+        except Exception:
+            pass
+
+    def reject_rate(self):
+        if self._stats is None:
+            return 0.0
+        try:
+            s = int(self._stats[0])
+            a = int(self._stats[2]) + 48 * int(self._stats[3])
+            return max(0.0, 100.0 * (a - s) / a) if s > 0 and a > 0 else 0.0
+        except Exception:
+            return 0.0
+
+    def _locate(self, g):
+        g = int(g) % self.total_rows
+        s = bisect.bisect_right(self._offsets_list, g) - 1
+        return s, g - self._offsets_list[s]
+
+    def _use_shard(self, s):
+        t = self._cache.get(s)
+        if t is None:
+            t = pq.read_table(self.shard_paths[s], memory_map=True)
+            self._cache[s] = t
+            self._cols_cache[s] = set(t.column_names)
+            self._order.append(s)
+            while len(self._order) > self.cache_size:
+                old = self._order.pop(0)
+                self._cache.pop(old, None)
+                self._cols_cache.pop(old, None)
+        else:
+            if self._order and self._order[-1] != s:
+                try:
+                    self._order.remove(s)
+                except ValueError:
+                    pass
+                self._order.append(s)
+        self.cached_table = t
+        self.cached_cols = self._cols_cache[s]
+        self.cached_shard_idx = s
+        self.cached_num_rows = t.num_rows
+
+    def clear_cache(self):
+        self._cache.clear()
+        self._order.clear()
+        self._cols_cache.clear()
+        self.cached_table = None
+        self.cached_cols = set()
+        self.cached_shard_idx = -1
+        self.cached_num_rows = 0
+        gc.collect()
+
+    def _extract_audio_from_row(self, r):
+        for ac in self.AUDIO_COLS:
+            if ac not in self.cached_cols:
+                continue
+            cell = self.cached_table[ac][r].as_py()
+            if cell is None:
+                continue
+            raw = None
+            if isinstance(cell, dict):
+                raw = cell.get("bytes")
+                if not raw and cell.get("array") is not None:
+                    return np.asarray(cell["array"], dtype=np.float32), int(cell.get("sampling_rate") or CFG.sample_rate)
+            elif isinstance(cell, (bytes, bytearray, memoryview)):
+                raw = bytes(cell)
+            elif isinstance(cell, list):
+                sr = int(self.cached_table["sampling_rate"][r].as_py()) if "sampling_rate" in self.cached_cols else CFG.sample_rate
+                return np.asarray(cell, dtype=np.float32), sr
+            if raw:
+                try:
+                    w, sr = sf.read(io.BytesIO(raw), dtype="float32")
+                    return w, sr
+                except Exception:
+                    w, sr = librosa.load(io.BytesIO(raw), sr=None, mono=True)
+                    return w.astype(np.float32), int(sr)
+        return None, None
+
+    def _extract_tokens_from_row(self, r):
+        for tc in self.TEXT_COLS:
+            if tc in self.cached_cols:
+                v = self.cached_table[tc][r].as_py()
+                if v and isinstance(v, str) and len(v.strip()) >= 2:
+                    return TOKENIZER.encode(v)
+        for ic in ["tok_ids", "input_ids", "tokens", "phoneme_ids"]:
+            if ic in self.cached_cols:
+                t = self.cached_table[ic][r].as_py()
+                if t and len(t) >= 4:
+                    return [int(x) for x in t]
+        return []
+
+    def _speaker_id(self, r):
+        if "speaker_id" in self.cached_cols:
+            v = self.cached_table["speaker_id"][r].as_py()
+            try:
+                return int(v if v is not None else 0) % CFG.max_speakers
+            except Exception:
+                return zlib.crc32(str(v).encode()) % CFG.max_speakers
+        if "client_id" in self.cached_cols:
+            return zlib.crc32(str(self.cached_table["client_id"][r].as_py() or "0").encode()) % CFG.max_speakers
+        return 0
+
+    def _prepare_row(self, r, strict=True, stats=None):
+        tids = self._extract_tokens_from_row(r)
+        if len(tids) < 6:
+            return None, "matn_qisqa"
+        if len(tids) > 260:
+            return None, "matn_uzun"
+        w, sr = self._extract_audio_from_row(r)
+        if w is None:
+            return None, "audio_yoq"
+        w = np.asarray(w, dtype=np.float32)
+        if w.ndim > 1:
+            w = w.mean(axis=1)
+        if int(sr) != CFG.sample_rate:
+            w = fast_resample_to_24k(w, int(sr))
+        w = remove_dc_offset(w, CFG.sample_rate)
+        w = ultra_safe_trim_silence(w, CFG.sample_rate)
+        dur = len(w) / CFG.sample_rate
+        cps = (len(tids) - 2) / max(dur, 1e-3)
+        if stats is not None:
+            stats["dur"] = dur
+            stats["cps"] = cps
+        if len(w) < int(CFG.min_wav_sec * CFG.sample_rate):
+            return None, "audio_qisqa"
+        pk = float(np.max(np.abs(w)))
+        if pk < 1e-3:
+            return None, "jim_audio"
+        if cps < CFG.min_cps or cps > CFG.max_cps:
+            return None, "cps_notekis"
+        mx = CFG.max_mel_frames * CFG.hop_size
+        if len(w) > mx:
+            return None, "audio_uzun"
+        w = (w * (0.92 / (pk + 1e-8))).astype(np.float32)
+        if tail_is_abrupt(w, CFG.sample_rate):
+            if strict:
+                return None, "oxiri_keskin"
+            w = finish_tail(w, CFG.sample_rate)
+            if len(w) > mx:
+                return None, "uzun"
+        return (torch.tensor(tids, dtype=torch.long), torch.from_numpy(w), self._speaker_id(r)), "ok"
+
+    def __getitem__(self, idx):
+        g = int(idx) % self.total_rows
+        s0, r0 = self._locate(g)
+        n_sh = len(self.shard_paths)
+        self._bump(0)
+        for att in range(48):
+            s = (s0 + att // 16) % n_sh
+            gd = 0
+            while self.row_counts[s] <= 0 and gd < n_sh:
+                s = (s + 1) % n_sh
+                gd += 1
+            r = (r0 + att * 7919) % max(1, self.row_counts[s])
+            try:
+                self._use_shard(s)
+                r = min(r, self.cached_num_rows - 1)
+                sample, _ = self._prepare_row(r, strict=(att < CFG.strict_attempts))
+            except Exception:
+                continue
+            if sample is not None:
+                self.last_valid_sample = sample
+                if att > 0:
+                    self._bump(1)
+                self._bump(2, att + 1)
+                return sample
+        self._bump(3)
+        if self.last_valid_sample is not None:
+            return self.last_valid_sample
+        raise RuntimeError(f"Audio o'qilmadi. Ustunlar: {self.cached_cols}")
+
+def build_epoch_order(row_counts, seed, epoch, block_rows):
+    rng = np.random.default_rng([int(seed) & 0x7FFFFFFF, int(epoch), 20240607])
+    offs = 0
+    blocks = []
+    for n in row_counts:
+        n = int(n)
+        if n > 0:
+            perm = offs + rng.permutation(n)
+            nb = max(1, int(round(n / float(max(1, block_rows)))))
+            blocks.extend(np.array_split(perm, nb))
+        offs += n
+    return np.concatenate([blocks[i] for i in rng.permutation(len(blocks))]).astype(np.int64)
+
+class DataOrderState:
+    def __init__(self):
+        self.seed = 0
+        self.consumed = 0
+        self.n = 0
+        self.block_rows = 0
+        self.sig = ""
+        self.origin = "-"
+        self.legacy_equiv = 0.0
+        self.shard_hits = None
+
+    def snapshot(self):
+        return dict(
+            version=DATA_ORDER_VERSION, seed=int(self.seed), consumed=int(self.consumed),
+            n=int(self.n), block_rows=int(self.block_rows), sig=str(self.sig),
+            legacy_equiv=float(self.legacy_equiv), saved_at=time.time(),
+            saved_at_text=time.strftime("%Y-%m-%d %H:%M:%S")
+        )
+
+    @staticmethod
+    def read_local():
+        try:
+            if STATE_JSON.exists():
+                return json.loads(STATE_JSON.read_text())
+        except Exception:
+            pass
+        return None
+
+    def write_local(self):
+        if self.n <= 0:
+            return
+        try:
+            d = self.snapshot()
+            tmp = STATE_JSON.with_name(STATE_JSON.name + ".tmp")
+            tmp.write_text(json.dumps(d, indent=1))
+            os.replace(tmp, STATE_JSON)
+            hit = ""
+            if self.shard_hits is not None and int(self.shard_hits.sum()) > 0:
+                hit = f" | shard {int(self.shard_hits.min()):,}/{int(self.shard_hits.max()):,} | teg: {int((self.shard_hits==0).sum())}"
+            PROGRESS_TXT.write_text(
+                f"epoch {self.consumed / max(1, self.n):.3f} | {self.consumed:,}/{self.n:,} | "
+                f"full: {self.consumed // max(1, self.n)} | seed {self.seed} | blok {self.block_rows}{hit} | {d['saved_at_text']}\n"
+            )
+        except Exception:
+            pass
+
+    def configure(self, n, sig, block_auto, saved, leg, n_sh):
+        env_b = int(os.environ.get("OQIM_BLOCK_ROWS", "0") or 0)
+        want = env_b if env_b > 0 else None
+        ok = False
+        if isinstance(saved, dict):
+            try:
+                ok = (
+                    int(saved["n"]) == int(n) and str(saved["sig"]) == str(sig)
+                    and int(saved["consumed"]) >= 0 and int(saved["block_rows"]) > 0
+                    and (want is None or int(saved["block_rows"]) == want)
+                )
+            except Exception:
+                ok = False
+        self.n, self.sig = int(n), str(sig)
+        if ok:
+            self.seed = int(saved["seed"])
+            self.consumed = int(saved["consumed"])
+            self.block_rows = int(saved["block_rows"])
+            self.legacy_equiv = float(saved.get("legacy_equiv", leg))
+            self.origin = "RESUMED"
+        else:
+            self.seed = secrets.randbits(31)
+            self.consumed = 0
+            self.block_rows = int(want or block_auto)
+            self.legacy_equiv = float(leg)
+            self.origin = "NEW_SEED"
+        self.shard_hits = np.zeros(max(1, int(n_sh)), dtype=np.int64)
+
+    def ui_line(self, ds=None):
+        s = f"Epoch {self.consumed / max(1, self.n):.3f} ({self.consumed:,}/{self.n:,}) | full: {self.consumed // max(1, self.n)}"
+        if self.legacy_equiv > 0:
+            s += f" | ≈{self.legacy_equiv:.2f}ee"
+        if ds is not None:
+            s += f" | rad~{ds.reject_rate():.1f}%"
+        return s
+
+DATA_STATE = DataOrderState()
+RESUMED_DATA_STATE = None
+
+class ResumableBlockSampler(Sampler):
+    def __init__(self, ds, state):
+        self.ds = ds
+        self.state = state
+        self.N = int(ds.total_rows)
+
+    def __len__(self):
+        return self.N
+
+    def __iter__(self):
+        st = self.state
+        N = self.N
+        epoch, pos = divmod(int(st.consumed), N)
+        offs = self.ds._offsets_list
+        while True:
+            order = build_epoch_order(self.ds.row_counts, st.seed, epoch, st.block_rows)
+            hits = st.shard_hits
+            for i in range(pos, N):
+                g = int(order[i])
+                if hits is not None:
+                    hits[bisect.bisect_right(offs, g) - 1] += 1
+                yield g
+            epoch += 1
+            pos = 0
+
+def auto_block_rows(ds):
+    cand = [i for i, n in enumerate(ds.row_counts) if n > 0]
+    s = random.choice(cand)
+    t0 = time.time()
+    try:
+        t = pq.read_table(ds.shard_paths[s], memory_map=True)
+        _ = t.num_rows
+        del t
+    except Exception:
+        pass
+    dt = time.time() - t0
+    gc.collect()
+    br = 480 if dt < 0.6 else (960 if dt < 2.0 else 1920)
+    print(f"[DATA] shard ~{dt:.2f}s → blok {br}")
+    return br
+
+def verify_data_order(ds, st):
+    N = ds.total_rows
+    order = build_epoch_order(ds.row_counts, st.seed, 0, st.block_rows)
+    ok = len(order) == N and bool(np.array_equal(np.sort(order), np.arange(N)))
+    print(f"[DATA] {'✅' if ok else '❌'} epoch plan: {len(order):,} {'OK' if ok else 'XATO!'}")
+    if not ok:
+        raise RuntimeError("Permutatsiya xato!")
+    ds.clear_cache()
+
+def verify_dataset_before_training(ds):
+    print("=" * 78)
+    print("🔍 DATASET DIAGNOSTIKA:")
+    nz = [n for n in ds.row_counts if n > 0]
+    print(f"   N={ds.total_rows:,} | shard={len(ds.shard_paths)} | min/max {min(nz):,}/{max(nz):,}")
+    first = next(i for i, n in enumerate(ds.row_counts) if n > 0)
+    ds._use_shard(first)
+    print(f"   Ustunlar: {sorted(list(ds.cached_cols))}")
+    for i in range(3):
+        t, w, s = ds[i]
+        print(f"   ✅ #{i+1}: {len(w)/CFG.sample_rate:.2f}s | {len(t)} tok | spk={s} → \"{TOKENIZER.decode(t)[:60]}\"")
+    print("=" * 78)
+
+def dataset_quality_report(ds, n=180):
+    print("📈 SIFAT HISOBOTI:")
+    rs = Counter()
+    ds_, cl = [], []
+    rng = np.random.default_rng()
+    cand = [i for i, c in enumerate(ds.row_counts) if c > 0]
+    pick = rng.choice(cand, size=min(6, len(cand)), replace=False)
+    per = max(1, n // len(pick))
+    total = 0
+    for s in pick:
+        s = int(s)
+        ds._use_shard(s)
+        for r in rng.integers(0, ds.row_counts[s], per):
+            st = {}
+            try:
+                _, rsn = ds._prepare_row(int(r), strict=True, stats=st)
+            except Exception:
+                rsn = "xato"
+            rs[rsn] += 1
+            total += 1
+            if "dur" in st:
+                ds_.append(st["dur"])
+                cl.append(st["cps"])
+    if ds_:
+        d = np.array(ds_)
+        c = np.array(cl)
+        print(f"   dur: avg {d.mean():.2f}s | p10 {np.percentile(d,10):.2f} | p90 {np.percentile(d,90):.2f}")
+        print(f"   cps: avg {c.mean():.1f} | p10 {np.percentile(c,10):.1f} | p90 {np.percentile(c,90):.1f}")
+    for k, v in rs.most_common():
+        print(f"   {k:<22} {v:>4} ({100.0*v/max(total,1):.0f}%)")
+    print("=" * 78)
+    ds.clear_cache()
+
+def collate_tts_batch(batch):
+    B = len(batch)
+    mt = max(len(x[0]) for x in batch)
+    mw = max(len(x[1]) for x in batch)
+    tp = torch.zeros((B, mt), dtype=torch.long)
+    tl = torch.zeros(B, dtype=torch.long)
+    wp = torch.zeros((B, mw), dtype=torch.float32)
+    wl = torch.zeros(B, dtype=torch.long)
+    sp = torch.zeros(B, dtype=torch.long)
+    for i, (t, w, s) in enumerate(batch):
+        tp[i, :len(t)] = t
+        tl[i] = len(t)
+        wp[i, :len(w)] = w
+        wl[i] = len(w)
+        sp[i] = s
+    return tp, tl, wp, wl, sp
+
+# ==============================================================================
+# 9. MODEL ARCHITECTURE — 362 TENSORS (100% CHECKPOINT COMPATIBLE + STRONG CLONE)
+# ==============================================================================
+class SinusoidalTimeEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        self.mlp = nn.Sequential(nn.Linear(dim, dim * 2), nn.SiLU(), nn.Linear(dim * 2, dim))
+
+    def forward(self, t):
+        dt = self.mlp[0].weight.dtype
+        h = self.dim // 2
+        f = torch.exp(
+            -math.log(10000.0) * torch.arange(0, h, device=t.device, dtype=torch.float32) / max(h - 1, 1)
+        )
+        a = t.float().unsqueeze(-1) * f.unsqueeze(0)
+        return self.mlp(torch.cat([torch.sin(a), torch.cos(a)], -1).to(dt))
+
+class RotaryPositionalEmbedding(nn.Module):
+    def __init__(self, hd, max_len=8192):
+        super().__init__()
+        self.hd = hd
+        inv = 1.0 / (10000.0 ** (torch.arange(0, hd, 2).float() / hd))
+        self.register_buffer("inv_freq", inv, persistent=False)
+        self._build(max_len, torch.device("cpu"))
+
+    def _build(self, ml, dev):
+        t = torch.arange(ml, device=dev, dtype=torch.float32)
+        f = torch.outer(t, self.inv_freq.to(dev))
+        self.register_buffer("cos_cached", torch.cos(f).unsqueeze(0).unsqueeze(0), persistent=False)
+        self.register_buffer("sin_cached", torch.sin(f).unsqueeze(0).unsqueeze(0), persistent=False)
+
+    def forward(self, x):
+        T = x.size(2)
+        if T > self.cos_cached.size(2) or self.cos_cached.device != x.device:
+            self._build(max(T + 512, 8192), x.device)
+        c = self.cos_cached[:, :, :T, :].to(x.dtype)
+        s = self.sin_cached[:, :, :T, :].to(x.dtype)
+        x1, x2 = x[..., 0::2], x[..., 1::2]
+        return torch.stack([x1 * c - x2 * s, x1 * s + x2 * c], -1).flatten(-2)
+
+class SafeMultiHeadAttention(nn.Module):
+    def __init__(self, dm, nh, dropout=0.05):
+        super().__init__()
+        self.dm = dm
+        self.nh = nh
+        self.hd = dm // nh
+        self.qkv = nn.Linear(dm, dm * 3)
+        self.proj = nn.Linear(dm, dm)
+        self.rope = RotaryPositionalEmbedding(self.hd, max_len=8192)
+        self.dropout = dropout
+
+    def forward(self, x, mask=None):
+        B, T, C = x.shape
+        qkv = self.qkv(x).reshape(B, T, 3, self.nh, self.hd).permute(2, 0, 3, 1, 4)
+        q, k, v = self.rope(qkv[0]), self.rope(qkv[1]), qkv[2]
+        sc = torch.matmul(q.float(), k.float().transpose(-2, -1)) / math.sqrt(self.hd)
+        if mask is not None:
+            sc = sc.masked_fill(~mask.unsqueeze(1).unsqueeze(2), -1e4)
+        a = torch.softmax(sc, -1).to(x.dtype)
+        return self.proj(torch.matmul(a, v).transpose(1, 2).reshape(B, T, C))
+
+class ConformerBlock(nn.Module):
+    def __init__(self, dm, nh, fm=2.5, ck=7):
+        super().__init__()
+        fd = int(dm * fm)
+        self.ffn1 = nn.Sequential(nn.Linear(dm, fd), nn.SiLU(), nn.Linear(fd, dm))
+        self.norm1 = nn.LayerNorm(dm)
+        self.attn = SafeMultiHeadAttention(dm, nh)
+        self.norm2 = nn.LayerNorm(dm)
+        self.conv_pw1 = nn.Conv1d(dm, dm * 2, 1)
+        self.conv_dw = nn.Conv1d(dm, dm, ck, padding=ck // 2, groups=dm)
+        self.conv_gn = nn.GroupNorm(8, dm)
+        self.conv_pw2 = nn.Conv1d(dm, dm, 1)
+        self.norm3 = nn.LayerNorm(dm)
+        self.ffn2 = nn.Sequential(nn.Linear(dm, fd), nn.SiLU(), nn.Linear(fd, dm))
+        self.norm_out = nn.LayerNorm(dm)
+
+    def forward(self, x, mask=None):
+        x = x + 0.5 * self.ffn1(self.norm1(x))
+        x = x + self.attn(self.norm2(x), mask=mask)
+        c = self.norm3(x).transpose(1, 2)
+        c = F.glu(self.conv_pw1(c), dim=1)
+        c = F.silu(self.conv_gn(self.conv_dw(c)))
+        c = self.conv_pw2(c).transpose(1, 2)
+        x = x + c
+        x = x + 0.5 * self.ffn2(self.norm_out(x))
+        if mask is not None:
+            x = x * mask.unsqueeze(-1).to(x.dtype)
+        return x
+
+class AdaLNDiTBlock(nn.Module):
+    def __init__(self, dm, nh, fm=2.5):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dm, elementwise_affine=False)
+        self.attn = SafeMultiHeadAttention(dm, nh)
+        self.norm2 = nn.LayerNorm(dm, elementwise_affine=False)
+        self.conv_pw1 = nn.Conv1d(dm, dm * 2, 1)
+        self.conv_dw = nn.Conv1d(dm, dm, 5, padding=2, groups=dm)
+        self.conv_gn = nn.GroupNorm(8, dm)
+        self.conv_pw2 = nn.Conv1d(dm, dm, 1)
+        self.norm3 = nn.LayerNorm(dm, elementwise_affine=False)
+        fd = int(dm * fm)
+        self.ffn = nn.Sequential(nn.Linear(dm, fd), nn.GELU(approximate="tanh"), nn.Linear(fd, dm))
+        self.ada_lin = nn.Sequential(nn.SiLU(), nn.Linear(dm, dm * 9))
+
+    def forward(self, x, cond, mask=None):
+        s1, b1, g1, s2, b2, g2, s3, b3, g3 = self.ada_lin(cond).chunk(9, -1)
+        h1 = self.norm1(x) * (1.0 + s1) + b1
+        x = x + torch.tanh(g1) * self.attn(h1, mask=mask)
+        h2 = (self.norm2(x) * (1.0 + s2) + b2).transpose(1, 2)
+        h2 = F.glu(self.conv_pw1(h2), dim=1)
+        h2 = F.silu(self.conv_gn(self.conv_dw(h2)))
+        h2 = self.conv_pw2(h2).transpose(1, 2)
+        x = x + torch.tanh(g2) * h2
+        h3 = self.norm3(x) * (1.0 + s3) + b3
+        x = x + torch.tanh(g3) * self.ffn(h3)
+        if mask is not None:
+            x = x * mask.unsqueeze(-1).to(x.dtype)
+        return x
+
+class ReferenceTimbreEncoder(nn.Module):
+    def __init__(self, nm, dm):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv1d(nm, 256, 5, padding=2), nn.SiLU(), nn.GroupNorm(8, 256),
+            nn.Conv1d(256, 384, 5, stride=2, padding=2), nn.SiLU(), nn.GroupNorm(8, 384),
+            nn.Conv1d(384, dm, 3, padding=1), nn.SiLU(),
+        )
+        self.proj = nn.Sequential(nn.Linear(dm * 2, dm), nn.LayerNorm(dm))
+
+    def forward(self, mel, mask=None, random_crop=False):
+        if mel.dim() == 2:
+            mel = mel.unsqueeze(0)
+        if mask is None:
+            mask = torch.ones((mel.size(0), mel.size(1)), dtype=torch.bool, device=mel.device)
+        if random_crop and mel.size(1) > 48:
+            B = mel.size(0)
+            cm = mask.clone()
+            for b in range(B):
+                vl = int(mask[b].sum().item())
+                if vl > 40:
+                    win = random.randint(int(vl * 0.45), int(vl * 0.80))
+                    st = random.randint(0, max(0, vl - win))
+                    cm[b] = False
+                    cm[b, st:st+win] = True
+            mask = cm
+        elif (not random_crop) and mel.size(1) > 16:
+            fe = mel.mean(-1)
+            ql = torch.quantile(fe.float(), 0.15, dim=-1, keepdim=True)
+            vm = (fe > (ql + 0.15)) & mask
+            for b in range(mel.size(0)):
+                if int(vm[b].sum().item()) >= 12:
+                    mask = mask.clone()
+                    mask[b] = vm[b]
+        h = self.net(mel.transpose(1, 2))
+        md = mask[:, ::2][:, :h.size(2)].unsqueeze(1).float()
+        ms = md.sum(-1, keepdim=True).clamp(min=1.0)
+        mn = (h * md).sum(-1, keepdim=True) / ms
+        vr = (((h - mn) * md).pow(2).sum(-1, keepdim=True) / ms).clamp(min=1e-5)
+        return self.proj(torch.cat([mn.squeeze(-1), torch.sqrt(vr).squeeze(-1)], -1))
+
+class VariancePredictor(nn.Module):
+    def __init__(self, dm):
+        super().__init__()
+        self.conv1 = nn.Conv1d(dm, dm, 3, padding=1)
+        self.norm1 = nn.LayerNorm(dm)
+        self.conv2 = nn.Conv1d(dm, dm, 3, padding=1)
+        self.norm2 = nn.LayerNorm(dm)
+        self.out = nn.Linear(dm, 1)
+
+    def forward(self, x, spk, mask):
+        h = x + spk.unsqueeze(1)
+        h = F.silu(self.norm1(self.conv1(h.transpose(1, 2)).transpose(1, 2)))
+        h = F.silu(self.norm2(self.conv2(h.transpose(1, 2)).transpose(1, 2)))
+        return self.out(h).squeeze(-1) * mask.to(h.dtype)
+
+class OqimKokoroV7(nn.Module):
+    def __init__(self):
+        super().__init__()
+        dm, nh = ACTIVE_CFG["d_model"], ACTIVE_CFG["n_heads"]
+        ne, nd, fm = ACTIVE_CFG["n_enc"], ACTIVE_CFG["n_dec"], ACTIVE_CFG["ffn_mult"]
+        self.dm, self.n_mels = dm, CFG.n_mels
+        self.tok_emb = nn.Embedding(64, dm, padding_idx=0)
+        self.spk_emb = nn.Embedding(CFG.max_speakers, dm)
+        self.spk_enc = ReferenceTimbreEncoder(CFG.n_mels, dm)
+        self.enc_blocks = nn.ModuleList([ConformerBlock(dm, nh, fm) for _ in range(ne)])
+        self.dur_pred = VariancePredictor(dm)
+        self.energy_pred = VariancePredictor(dm)
+        self.energy_proj = nn.Linear(1, dm)
+        self.prior_proj = nn.Linear(dm, CFG.n_mels)
+        self.mel_in = nn.Linear(CFG.n_mels * 2, dm)
+        self.time_emb = SinusoidalTimeEmb(dm)
+        self.dec_blocks = nn.ModuleList([AdaLNDiTBlock(dm, nh, fm) for _ in range(nd)])
+        self.final_norm = nn.LayerNorm(dm)
+        self.vel_out = nn.Linear(dm, CFG.n_mels)
+
+    @staticmethod
+    @torch.no_grad()
+    def viterbi_monotonic_align(h_prior, mel_target, tl, ml):
+        with _autocast(enabled=False):
+            d_all = torch.cdist(h_prior.float(), mel_target.float(), p=2.0)
+            dn = _numba_viterbi_batch(d_all.cpu().numpy(), tl.cpu().numpy(), ml.cpu().numpy())
+        return torch.from_numpy(dn).to(device=h_prior.device, non_blocking=True)
+
+    @staticmethod
+    def build_monotonic_alignment(h, durs, max_len):
+        with _autocast(enabled=False):
+            B, T, D = h.shape
+            dev = h.device
+            di = torch.clamp(torch.round(durs.float()), min=1.0).long()
+            cd = torch.cumsum(di, -1)
+            fp = torch.arange(max_len, device=dev).unsqueeze(0).expand(B, max_len).contiguous()
+            ti = torch.clamp(torch.searchsorted(cd.contiguous(), fp, right=True), 0, T - 1)
+            return torch.gather(h, 1, ti.unsqueeze(-1).expand(B, max_len, D))
+
+    def forward(self, tok_ids, tok_lens, mel_norm, mel_lens, spk_ids):
+        B, T_tok = tok_ids.shape
+        T_mel = mel_norm.size(1)
+        dev = tok_ids.device
+        tmask = torch.arange(T_tok, device=dev).unsqueeze(0) < tok_lens.unsqueeze(1)
+        mmask = torch.arange(T_mel, device=dev).unsqueeze(0) < mel_lens.unsqueeze(1)
+
+        h = self.tok_emb(tok_ids.clamp(0, 63))
+        for b in self.enc_blocks:
+            h = b(h, mask=tmask)
+
+        # ⭐ VOICE CLONING BOOST: spk_emb shortcut 88% o'chiriladi, gradient spk_enc ga tushadi
+        sd = (torch.rand(B, 1, device=dev) < CFG.spk_emb_keep_prob).to(h.dtype)
+        sv_ref = self.spk_enc(mel_norm, mmask, random_crop=True)
+        sv = sv_ref + CFG.spk_emb_scale * sd * self.spk_emb(spk_ids.clamp(0, CFG.max_speakers - 1))
+
+        log_dp = self.dur_pred(h, sv, tmask)
+        e_p = self.energy_pred(h, sv, tmask)
+        h_prior = self.prior_proj(h)
+
+        tgt_durs = self.viterbi_monotonic_align(h_prior.detach(), mel_norm.detach(), tok_lens, mel_lens)
+        log_dt = torch.log(tgt_durs + 1.0) * tmask.float()
+        dur_l = F.smooth_l1_loss(log_dp * tmask.float(), log_dt, reduction="sum") / tmask.sum().clamp(min=1.0)
+        ptl = (torch.exp(log_dp.clamp(-2.0, 5.0)) - 1.0) * tmask.float()
+        ratio_l = F.l1_loss(ptl.sum(-1) / mel_lens.float().clamp(min=1.0), torch.ones(B, device=dev))
+        total_dur_l = dur_l + 0.25 * ratio_l
+
+        fgt = mel_norm.mean(-1)
+        e_exp = self.build_monotonic_alignment(e_p.unsqueeze(-1), tgt_durs, T_mel).squeeze(-1)
+        e_l = F.smooth_l1_loss(e_exp * mmask.float(), fgt * mmask.float(), reduction="sum") / mmask.sum().clamp(min=1.0)
+
+        h_en = h + self.energy_proj(e_p.unsqueeze(-1))
+        mu_c = self.build_monotonic_alignment(h_en, tgt_durs, T_mel)
+        mu_p = self.build_monotonic_alignment(h_prior, tgt_durs, T_mel)
+
+        fm = mmask.unsqueeze(-1).to(mel_norm.dtype)
+        fden = (fm.sum() * self.n_mels).clamp(min=1.0)
+
+        # ⭐ F0 + Formant + Articulation band emphasis (bins 4..92)
+        fbw = torch.ones((1, 1, self.n_mels), device=dev, dtype=mel_norm.dtype)
+        fbw[:, :, 4:48] = 2.05   # F0 va asosiy ohang harmonikalari
+        fbw[:, :, 48:92] = 1.85  # Undosh va artikulyatsiya
+        bright = (mel_norm.detach() > -0.45).to(mel_norm.dtype)
+        fw = (1.0 + 2.10 * bright) * fbw * fm
+        wden = fw.sum().clamp(min=1.0)
+
+        prior_l1 = (torch.abs(mu_p - mel_norm) * fw).sum() / wden
+        prior_h = (F.smooth_l1_loss(mu_p, mel_norm, beta=0.35, reduction="none") * fw).sum() / wden
+        prior_l = 0.65 * prior_l1 + 0.35 * prior_h
+
+        t = torch.rand(B, device=dev, dtype=mel_norm.dtype).clamp(1e-4, 0.9999)
+        z0 = torch.randn_like(mel_norm)
+        te = t.view(B, 1, 1)
+        xt = (1.0 - te) * z0 + te * mel_norm
+        vt = mel_norm - z0
+
+        cfg = (torch.rand(B, 1, 1, device=dev) > 0.12).to(mel_norm.dtype)
+        di = self.mel_in(torch.cat([xt, mu_p * cfg], -1)) + mu_c * cfg
+        cv = self.time_emb(t).unsqueeze(1) + (sv * cfg.squeeze(-1)).unsqueeze(1) + 0.45 * mu_c * cfg
+
+        xd = di
+        for b in self.dec_blocks:
+            xd = b(xd, cv, mask=mmask)
+        vp = self.vel_out(self.final_norm(xd))
+
+        x1 = xt + (1.0 - te) * vp
+        vl1 = (torch.abs(vp - vt) * fw).sum() / wden
+        vh = (F.smooth_l1_loss(vp, vt, beta=0.35, reduction="none") * fw).sum() / wden
+        pf = x1[:, :, 1:] - x1[:, :, :-1]
+        gf = mel_norm[:, :, 1:] - mel_norm[:, :, :-1]
+        fgl = (torch.abs(pf - gf) * fm).sum() / fden
+
+        if T_mel > 2:
+            tm = (mmask[:, 1:] & mmask[:, :-1]).unsqueeze(-1).to(mel_norm.dtype)
+            tden = (tm.sum() * self.n_mels).clamp(min=1.0)
+            pt = x1[:, 1:, :] - x1[:, :-1, :]
+            gt = mel_norm[:, 1:, :] - mel_norm[:, :-1, :]
+            tgl = (torch.abs(pt - gt) * tm).sum() / tden
+        else:
+            tgl = 0.0
+
+        fm_l = 0.55 * vl1 + 0.25 * vh + 0.20 * fgl + 0.12 * tgl
+        return fm_l.unsqueeze(0), prior_l.unsqueeze(0), total_dur_l.unsqueeze(0), e_l.unsqueeze(0)
+
+    @torch.no_grad()
+    def _plan_chunk(self, ids, spk, left=None, right=None):
+        with _autocast(enabled=False):
+            dev = spk.device
+            hl = bool(left)
+            hr = bool(right)
+            if not hl and not hr:
+                fi = list(ids)
+                si, ei = 0, len(fi)
+            else:
+                core = list(ids)
+                if hl and len(core) > 1 and core[0] == TOKENIZER.bos_id:
+                    core = core[1:]
+                if hr and len(core) > 1 and core[-1] == TOKENIZER.eos_id:
+                    core = core[:-1]
+                pre = ([TOKENIZER.bos_id] + list(left)[-36:]) if hl else []
+                suf = (list(right)[:36] + [TOKENIZER.eos_id]) if hr else []
+                if hl and len(pre) > 1 and pre[-1] != TOKENIZER.tok2id[" "]:
+                    pre.append(TOKENIZER.tok2id[" "])
+                if hr and len(suf) > 1 and suf[0] != TOKENIZER.tok2id[" "]:
+                    suf = [TOKENIZER.tok2id[" "]] + suf
+                fi = pre + core + suf
+                si = len(pre)
+                ei = si + len(core)
+            ti = torch.tensor([fi], dtype=torch.long, device=dev)
+            tm = torch.ones_like(ti, dtype=torch.bool)
+            h = self.tok_emb(ti.clamp(0, 63))
+            for b in self.enc_blocks:
+                h = b(h, mask=tm)
+            ld = self.dur_pred(h, spk, tm)
+            en = self.energy_pred(h, spk, tm)
+            rd = torch.clamp(torch.exp(ld.clamp(-2.0, 5.0)) - 1.0, min=1.0)[0]
+            return {
+                "ids": fi[si:ei],
+                "h": h[:, si:ei, :].contiguous(),
+                "energy": en[:, si:ei].contiguous(),
+                "raw_durs": rd[si:ei].contiguous(),
+            }
+
+    @torch.no_grad()
+    def _render_chunk(self, plan, durs, spk, steps, cfg_s, temp, gen, prefix=None, cfg_r=0.72):
+        with _autocast(enabled=False):
+            dev = spk.device
+            d = durs.to(dev).float().unsqueeze(0)
+            total = max(1, int(torch.round(d).sum().item()))
+            hp = self.prior_proj(plan["h"])
+            he = plan["h"] + self.energy_proj(plan["energy"].unsqueeze(-1))
+            mc = self.build_monotonic_alignment(he, d, total)
+            mp = self.build_monotonic_alignment(hp, d, total)
+            z = torch.randn(mp.shape, generator=gen, device=dev) * temp
+            cl = 0
+            if prefix is not None and prefix.get("mel") is not None:
+                pm = prefix["mel"]
+                pcd = prefix["mu_cond"]
+                ppr = prefix["mu_prior"]
+                pz = prefix["z0"]
+                cl = int(pm.size(1))
+                if cl > 0:
+                    mcd = torch.cat([pcd, mc], 1)
+                    mpr = torch.cat([ppr, mp], 1)
+                    xt = torch.cat([pz, z], 1)
+                else:
+                    mcd, mpr, xt = mc, mp, z
+            else:
+                mcd, mpr, xt = mc, mp, z
+
+            fl = mpr.size(1)
+            mm = torch.ones((1, fl), dtype=torch.bool, device=dev)
+            u = torch.linspace(0.0, 1.0, steps + 1, device=dev)
+            tg = 1.0 - torch.cos(u * math.pi * 0.5)
+            use_cfg = cfg_s > 1.0
+            if use_cfg:
+                mcdb = torch.cat([mcd, torch.zeros_like(mcd)], 0)
+                mprb = torch.cat([mpr, torch.zeros_like(mpr)], 0)
+                spb = torch.cat([spk, torch.zeros_like(spk)], 0)
+                mmb = torch.cat([mm, mm], 0)
+            else:
+                mcdb, mprb, spb, mmb = mcd, mpr, spk, mm
+            nb = mcdb.size(0)
+            for i in range(steps):
+                tc, tn = tg[i], tg[i + 1]
+                dt = tn - tc
+                if cl > 0:
+                    xt[:, :cl, :] = (1.0 - tc) * pz + tc * pm
+                te = self.time_emb(tc.expand(nb)).unsqueeze(1)
+                xb = torch.cat([xt, xt], 0) if use_cfg else xt
+                xi = self.mel_in(torch.cat([xb, mprb], -1)) + mcdb
+                cd = te + spb.unsqueeze(1) + 0.45 * mcdb
+                hh = xi
+                for b in self.dec_blocks:
+                    hh = b(hh, cd, mask=mmb)
+                va = self.vel_out(self.final_norm(hh))
+                if use_cfg:
+                    vc, vu = va[0:1], va[1:2]
+                    vcf = vu + cfg_s * (vc - vu)
+                    if cfg_r > 0.0:
+                        sc = vc.std(dim=(1, 2), keepdim=True).clamp(min=1e-5)
+                        ss = vcf.std(dim=(1, 2), keepdim=True).clamp(min=1e-5)
+                        v = cfg_r * (vcf * (sc / ss)) + (1.0 - cfg_r) * vcf
+                    else:
+                        v = vcf
+                else:
+                    v = va
+                xt = xt + dt * v
+
+            out = xt.clamp(-3.3, 2.6)
+            ou = out[:, cl:, :].contiguous()
+            k = min(20, total)
+            np_ = {
+                "mel": ou[:, -k:, :].detach(),
+                "mu_cond": mc[:, -k:, :].detach(),
+                "mu_prior": mp[:, -k:, :].detach(),
+                "z0": z[:, -k:, :].detach(),
+            }
+            return ou.squeeze(0).contiguous(), np_
+
+    @torch.no_grad()
+    def synthesize(self, text, ref_mel, steps=44, cfg_scale=1.80, speed=1.0, temperature=0.74):
+        _, m, _ = synthesize_long(
+            self, text, ref_mel, steps=steps, cfg_scale=cfg_scale,
+            temperature=temperature, speed=speed, vocode=False
+        )
+        return m
+
+# ==============================================================================
+# 10. LONG-FORM SYNTHESIS PIPELINE (CLEAR ARTICULATION + PROSODY CLONING)
+# ==============================================================================
+_PC = {",", ";", ":"}
+_PT = {".", "!", "?"}
+
+def _split_balanced(clause, max_c):
+    words = clause.split()
+    tot = len(clause)
+    n = max(2, math.ceil(tot / max_c))
+    tgt = tot / n
+    parts, cur, cl = [], [], 0
+    for w in words:
+        add = len(w) + (1 if cur else 0)
+        if cur and cl + add > tgt and len(parts) < n - 1:
+            parts.append(" ".join(cur))
+            cur, cl = [w], len(w)
+        else:
+            cur.append(w)
+            cl += add
+    if cur:
+        parts.append(" ".join(cur))
+    return parts
+
+def split_text_into_chunks(text, max_chars=80):
+    t = (text or "").replace("\u2026", "...")
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\.{2,}", "...", t)
+    if not t:
+        return []
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", t) if s.strip()]
+    chunks = []
+    for s in sents:
+        ell = s.endswith("...")
+        body = s.rstrip(".!? ").strip()
+        tail = s[len(body):].strip()
+        if not body:
+            if chunks and ("..." in tail or ell):
+                chunks[-1]["pause"] = "ellipsis"
+            continue
+        em = tail[-1] if tail and tail[-1] in "!?" else "."
+        sp = "ellipsis" if ("..." in tail or ell) else "sent"
+        clauses = [c.strip() for c in re.split(r"(?<=[,;:])\s+", body) if c.strip()]
+        units = []
+        for c in clauses:
+            if len(c) > max_chars:
+                parts = _split_balanced(c, max_chars)
+                for k, pt in enumerate(parts):
+                    units.append((pt, k < len(parts) - 1))
+            else:
+                units.append((c, False))
+        packed, cur = [], None
+        for txt, soft in units:
+            if cur is None:
+                cur = [txt, soft]
+                continue
+            if (not cur[1]) and (not soft) and len(cur[0]) + 1 + len(txt) <= max_chars:
+                cur[0] = cur[0] + " " + txt
+            else:
+                packed.append((cur[0], cur[1]))
+                cur = [txt, soft]
+        if cur is not None:
+            packed.append((cur[0], cur[1]))
+        npk = len(packed)
+        for k, (txt, soft) in enumerate(packed):
+            ss, se = (k == 0), (k == npk - 1)
+            if se:
+                chunks.append({"text": txt + em, "pause": sp, "sent_start": ss, "sent_end": True})
+            elif txt[-1:] in ",;:":
+                chunks.append({"text": txt, "pause": "comma", "sent_start": ss, "sent_end": False})
+            else:
+                chunks.append({"text": txt, "pause": "soft", "sent_start": ss, "sent_end": False})
+    if chunks:
+        chunks[-1]["pause"] = "end"
+        chunks[-1]["sent_end"] = True
+    return chunks
+
+def _split_half(text):
+    words = text.split()
+    half = len(text) / 2.0
+    acc, cut = 0, max(1, len(words) // 2)
+    for i, w in enumerate(words):
+        acc += len(w) + 1
+        if acc >= half:
+            cut = min(max(1, i + 1), len(words) - 1)
+            break
+    return " ".join(words[:cut]), " ".join(words[cut:])
+
+def shape_durations(ids, raw, speed=1.0, rate_scale=1.0):
+    """⭐ TINIQ TALAFFUZ: har bir harf to'liq aytiladi, tutuq belgisi (') ravon o'tadi."""
+    n = len(ids)
+    d = raw.clone().float() / max(speed, 0.4)
+    has_eos = n > 0 and int(ids[-1]) == TOKENIZER.eos_id
+    last = (n - 2) if has_eos else (n - 1)
+    cf, nl = 0.0, 0
+    cl = lambda v, lo, hi: min(max(v, lo), hi)
+    multi_ids = set(TOKENIZER.tok2id.get(mg, -1) for mg in TOKENIZER.multi)
+    for i, tid in enumerate(ids):
+        ti = int(tid)
+        tok = TOKENIZER.id2tok.get(ti, "")
+        v = float(d[i])
+        if ti in (TOKENIZER.bos_id, TOKENIZER.eos_id):
+            v = cl(v, 2.0, 6.0)
+        elif tok == " ":
+            v = cl(v * rate_scale, 1.5, 5.5)
+            cf += v
+        elif tok == "-":
+            v = cl(v, 1.0, 2.5)
+        elif tok == "'":
+            v = cl(v, 1.0, 2.5)
+            cf += v
+        elif tok in _PC:
+            v = cl(v, 2.0, 5.0) if i == last else cl(v, 5.0, 14.0)
+        elif tok in _PT:
+            v = cl(v, 2.0, 6.0) if i == last else cl(v, 4.0, 11.0)
+        elif ti in multi_ids:
+            v = cl(v * rate_scale, 4.0, 30.0)
+            cf += v
+            nl += 1
+        else:
+            v = cl(v * rate_scale, 3.2, 25.0)
+            cf += v
+            nl += 1
+        d[i] = v
+    c = torch.cumsum(d, 0)
+    r = torch.round(c)
+    return torch.clamp(torch.diff(r, prepend=torch.zeros(1)), min=1.0), cf, nl
+
+def estimate_room_tone(ref):
+    e = ref.mean(-1)
+    k = max(3, int(0.08 * e.numel()))
+    idx = torch.topk(-e, k).indices
+    return ref[idx].mean(0).clamp(min=-2.5, max=-1.55)
+
+def _room_frames(room, n):
+    if n <= 0:
+        return room.new_zeros((0, room.numel()))
+    return room.unsqueeze(0).expand(n, -1).clone()
+
+def _prepare_chunk_plan(m, ch, spk, speed, left, right):
+    ids = TOKENIZER.encode(ch["text"])
+    lc = left if not ch.get("sent_start", True) else None
+    rc = right if not ch.get("sent_end", True) else None
+    p = m._plan_chunk(ids, spk, left=lc, right=rc)
+    durs, cf, nl = shape_durations(p["ids"], p["raw_durs"].float().cpu(), speed, 1.0)
+    norm = TOKENIZER.normalize_text(ch["text"])
+    p.update(
+        text=ch["text"], pause=ch["pause"],
+        sent_start=ch.get("sent_start", True), sent_end=ch.get("sent_end", True),
+        core_frames=cf, n_letters=max(nl, 1),
+        n_chars=len(re.sub(r"[^a-z']", "", norm)), durs_init=durs
+    )
+    return p
+
+def synthesize_stream(m, text, ref_mel, steps=44, cfg_scale=1.80, temperature=0.74,
+                      speed=1.0, rate_lock=True, max_chunk_chars=80, seed=42, vocode=True):
+    m.eval()
+    dev = next(m.parameters()).device
+    ref = ref_mel.detach().to(dev).float()
+    if ref.dim() == 2:
+        ref = ref.unsqueeze(0)
+    rm = torch.ones((1, ref.size(1)), dtype=torch.bool, device=dev)
+    with torch.no_grad(), _autocast(enabled=False):
+        sp = m.spk_enc(ref, rm, random_crop=False)
+    room = estimate_room_tone(ref[0])
+
+    # Referens energiya darajasini olamiz (ohang/dinamika yaqinligi uchun)
+    ref_fe = ref[0].mean(-1)
+    ref_active = ref_fe[ref_fe > float(torch.quantile(ref_fe, 0.25))]
+    ref_en_target = float(ref_active.mean().item()) if ref_active.numel() > 0 else None
+
+    work_q = deque(split_text_into_chunks(text, max_chunk_chars))
+    if not work_q:
+        return
+    valid = []
+    while work_q:
+        ch = work_q.popleft()
+        bi = TOKENIZER.encode_body(ch["text"])
+        if len(bi) <= 1:
+            if valid and ch["pause"] in ("sent", "ellipsis"):
+                valid[-1]["pause"] = ch["pause"]
+                valid[-1]["sent_end"] = True
+            continue
+        if len(bi) > 110 and len(ch["text"].split()) > 1:
+            l, r = _split_half(ch["text"])
+            work_q.appendleft({"text": r, "pause": ch["pause"], "sent_start": False, "sent_end": ch.get("sent_end", True)})
+            work_q.appendleft({"text": l, "pause": "soft", "sent_start": ch.get("sent_start", True), "sent_end": False})
+            continue
+        ch["body_ids"] = bi
+        valid.append(ch)
+    if not valid:
+        return
+    valid[-1]["pause"] = "end"
+    valid[-1]["sent_end"] = True
+    n_tot = len(valid)
+    anchor_r = None
+    anchor_e = ref_en_target
+    prefix = None
+    prev_tail = None
+    prev_pause_frames = 0
+
+    for i, ch in enumerate(valid):
+        lb = valid[i - 1]["body_ids"] if i > 0 else None
+        rb = valid[i + 1]["body_ids"] if i + 1 < n_tot else None
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(int(seed) + i * 10007)
+        p = _prepare_chunk_plan(m, ch, sp, speed, lb, rb)
+        em = float(p["energy"].mean().item())
+        if anchor_e is None:
+            anchor_e = em
+        else:
+            sh = np.clip(anchor_e - em, -0.20, 0.20)
+            p["energy"] = p["energy"] + float(sh) * 0.60
+            anchor_e = 0.85 * anchor_e + 0.15 * float(p["energy"].mean().item())
+        cr = p["core_frames"] / max(p["n_letters"], 1)
+        sc = 1.0
+        if rate_lock:
+            if anchor_r is None:
+                anchor_r = cr
+            else:
+                sc = float(np.clip(anchor_r / max(cr, 1e-3), 0.93, 1.07))
+                anchor_r = 0.80 * anchor_r + 0.20 * (cr * sc)
+        durs, _, _ = shape_durations(p["ids"], p["raw_durs"].float().cpu(), speed, sc)
+        mel, prefix = m._render_chunk(p, durs, sp, steps, cfg_scale, temperature, gen, prefix=prefix)
+
+        e = mel.mean(-1)
+        sil = float(room.mean())
+        spr = float(torch.quantile(e.float(), 0.70))
+        if spr - sil >= 0.35:
+            thr = sil + 0.20 * (spr - sil)
+            idx = torch.nonzero(e > thr).flatten()
+            if idx.numel() > 0:
+                a = max(0, int(idx[0]) - 3) if ch.get("sent_start", True) else 0
+                b = min(mel.size(0), int(idx[-1]) + 4) if ch.get("sent_end", True) else mel.size(0)
+                if b - a >= 12:
+                    mel = mel[a:b]
+
+        pause_frames = int(PAUSE_SEC.get(ch["pause"], 0.15) * FPS) if i < n_tot - 1 else 0
+        lead_frames = PAD_START_FRAMES if i == 0 else (prev_pause_frames - prev_pause_frames // 2)
+        trail_frames = PAD_END_FRAMES if i == n_tot - 1 else (pause_frames // 2)
+
+        lead_room = _room_frames(room, lead_frames)
+        trail_room = _room_frames(room, trail_frames)
+        piece = torch.cat([lead_room, mel, trail_room], 0)
+
+        wn = None
+        if vocode:
+            wn = vocode_mel_to_wav(
+                piece, fade_out=False, left_ctx_mel=prev_tail,
+                room_mel=room, auto_pad=VOC_PAD_FRAMES if i == 0 else 0
+            )
+
+        prev_tail = piece[-min(16, piece.size(0)):, :].detach()
+        prev_pause_frames = pause_frames
+        sp_sec = mel.size(0) / FPS
+
+        yield {
+            "idx": i, "total": n_tot, "text": p["text"], "pause": p["pause"],
+            "wav": wn, "mel": piece.detach().cpu(), "speech_sec": sp_sec,
+            "cps": p["n_chars"] / max(sp_sec, 1e-3), "rate_scale": sc
+        }
+
+def synthesize_long(m, text, ref_mel, **kw):
+    ws, ms, cs = [], [], []
+    for it in synthesize_stream(m, text, ref_mel, **kw):
+        if it["wav"] is not None:
+            ws.append(it["wav"])
+        ms.append(it["mel"])
+        cs.append(it["cps"])
+    mel = torch.cat(ms, 0) if ms else torch.zeros((8, CFG.n_mels))
+    info = {
+        "n_chunks": len(ms),
+        "cps_min": float(min(cs)) if cs else 0.0,
+        "cps_max": float(max(cs)) if cs else 0.0,
+    }
+    if not ws:
+        return np.zeros(int(0.2 * CFG.sample_rate), dtype=np.float32), mel, info
+    w = ws[0]
+    for k in range(1, len(ws)):
+        xf = int(XFADE_MS * CFG.sample_rate / 1000)
+        w = _safe_xfade(w, ws[k], xf)
+    return w, mel, info
+
+SYNTH_DEFAULTS = dict(
+    steps=44, cfg_scale=1.80, temperature=0.74,
+    speed=1.0, rate_lock=True, max_chunk_chars=80, seed=42
+)
+
+def load_inference_model(p=None):
+    m = OqimKokoroV7().to(DEVICE)
+    path = Path(p) if p else (CKPT_DIR / "latest_checkpoint.pt")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    m.load_state_dict(ck.get("model", ck), strict=True)
+    m.eval()
+    return m
+
+def speak(text, out_path="/temp/oqim_output.wav", model=None, post=True,
+          prosody=None, prosody_strength=None, prosody_mode=None,
+          ref_wav=None, ref_mel=None, show=None, png_path=None, **kw):
+    """
+    ⭐ UNIVERSAL SPEAK FUNKSIYASI:
+    - Sintez + Prosody Transfer v2 + Quality Gate + WAV saqlash + Console PNG rasm.
+    """
+    raw = model
+    if raw is None:
+        if "MODEL" in globals() and MODEL is not None:
+            raw = MODEL.module if isinstance(MODEL, nn.DataParallel) else MODEL
+        else:
+            raw = load_inference_model()
+
+    use_prosody = PROSODY_ENABLED if prosody is None else bool(prosody)
+    p_str = PROSODY_STRENGTH if prosody_strength is None else float(prosody_strength)
+    p_mode = PROSODY_MODE if prosody_mode is None else str(prosody_mode)
+    use_show = SHOW_IMAGES if show is None else bool(show)
+
+    r_wav = REF_WAV_NP if ref_wav is None else np.asarray(ref_wav, dtype=np.float32)
+    r_mel = REF_MEL_NORM if ref_mel is None else ref_mel
+
+    params = dict(SYNTH_DEFAULTS)
+    params.update(kw)
+    w_raw, mel_out, info = synthesize_long(raw, text, r_mel, **params)
+    w_clean = postprocess_wav(w_raw, CFG.sample_rate) if post else w_raw
+    q0 = _q_score(w_clean, CFG.sample_rate)
+    q1 = q0
+
+    if use_prosody and p_str > 0.01:
+        w_pr = transfer_prosody(w_clean, r_wav, sr=CFG.sample_rate, strength=p_str, mode=p_mode)
+        q1 = _q_score(w_pr, CFG.sample_rate)
+        if (not QUALITY_GATE) or (q1 >= q0 - 1.0):
+            w_final = w_pr
+        else:
+            w_final = w_clean
+    else:
+        w_final = w_clean
+
+    if out_path:
+        sf.write(str(out_path), w_final, CFG.sample_rate)
+    if png_path is None and out_path:
+        png_path = str(Path(out_path).with_suffix(".png"))
+    if png_path:
+        saved_png = save_audio_png(
+            w_final, mel_out, png_path,
+            title=f"SPEAK ({len(w_final)/CFG.sample_rate:.2f}s | q={max(q0,q1):.1f})",
+            ref_mel=r_mel
+        )
+        if use_show and saved_png is not None:
+            show_png(saved_png, width=IMAGE_WIDTH)
+
+    print(
+        f"✅ {out_path} | {len(w_final)/CFG.sample_rate:.2f}s | {info['n_chunks']} bo'lak | "
+        f"peak={float(np.max(np.abs(w_final))):.3f} | prosody={p_mode}:{p_str:.2f} (q {q0:.1f}→{q1:.1f})"
+    )
+    return w_final
+
+def data_status():
+    try:
+        print(PROGRESS_TXT.read_text())
+    except Exception:
+        print("[DATA] hali yo'q.")
+
+# ==============================================================================
+# 11. STUDIO UI + CONSOLE SPECTROGRAM ARCHIVER
+# ==============================================================================
+def render_wide_mel_png(nm, title, dur):
+    x = nm.detach().float().cpu()
+    if x.dim() == 3:
+        x = x.squeeze(0)
+    if x.size(-1) == CFG.n_mels:
+        lm = MEL_EXTRACTOR.denormalize(x).numpy().T
+    else:
+        lm = MEL_EXTRACTOR.denormalize(x).numpy()
+    fig, ax = plt.subplots(figsize=(10.5, 2.25), dpi=140)
+    fig.patch.set_facecolor("#090d16")
+    ax.set_facecolor("#090d16")
+    im = ax.imshow(
+        lm, aspect="auto", origin="lower", interpolation="bilinear",
+        cmap="magma", vmin=-10.8, vmax=-0.2
+    )
+    ec = lm.mean(0)
+    en = np.clip((ec - (-10.5)) / 8.0, 0, 1) * 84 + 5
+    ax.plot(np.arange(len(en)), en, color="#38bdf8", lw=1.35, alpha=0.92)
+    ax.set_title(f"{title} | {dur:.2f}s | 24kHz 100-Band", color="#e2e8f0", fontsize=9.5, fontweight="bold", pad=5)
+    ax.tick_params(colors="#94a3b8", labelsize=7.5)
+    ax.set_ylabel("Mel", color="#94a3b8", fontsize=8)
+    for sp in ax.spines.values():
+        sp.set_color("#1e293b")
+    cb = fig.colorbar(im, ax=ax, fraction=0.018, pad=0.012)
+    cb.ax.tick_params(colors="#94a3b8", labelsize=7)
+    plt.tight_layout(pad=0.35)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
+
+def wav_to_b64(w):
+    buf = io.BytesIO()
+    sf.write(buf, w, CFG.sample_rate, format="WAV")
+    return base64.b64encode(buf.getvalue()).decode()
+
+class StudioUI:
+    def __init__(self):
+        self.hid = "oqim_h"
+        self.mid = "oqim_m"
+        self.init = False
+
+    def _init(self):
+        if not self.init:
+            display(HTML("<div id='oqim_h'>...</div>"), display_id=self.hid)
+            display(HTML(
+                "<div id='oqim_m' style='background:#0b1120;color:#94a3b8;padding:12px;"
+                "border-radius:10px;border:1px solid #1e293b;'>⏳ Namunalar tayyorlanmoqda...</div>"
+            ), display_id=self.mid)
+            self.init = True
+
+    def update_metrics(self, step, total, tl, fl, dl, el, lr, sps, hf, data_line=""):
+        self._init()
+        pct = min(100.0, step / max(total, 1) * 100)
+        html = f"""<div style="background:linear-gradient(135deg,#090d16,#111827);color:#f8fafc;padding:14px 18px;border-radius:12px;border:1px solid #1e293b;margin-bottom:8px;font-family:'Segoe UI',sans-serif;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;"><div>
+        <span style="background:#0284c7;color:#fff;padding:3px 9px;border-radius:6px;font-size:11px;font-weight:700;">OQIM-KOKORO {CODE_VERSION}</span>
+        <span style="margin-left:10px;font-size:13px;color:#38bdf8;font-weight:600;">362-TENSOR · STRONG PROSODY CLONE</span></div>
+        <div style="font-size:12px;color:#94a3b8;">Step/s: <b style="color:#4ade80;">{sps:.2f}</b> | LR: <b>{lr:.2e}</b> | HF: <b style="color:#38bdf8;">{hf}</b></div></div>
+        <div style="width:100%;background:#1e293b;height:7px;border-radius:4px;overflow:hidden;margin-bottom:6px;"><div style="width:{pct:.2f}%;background:linear-gradient(90deg,#06b6d4,#3b82f6,#8b5cf6);height:100%;"></div></div>
+        <div style="font-size:11px;color:#94a3b8;margin-bottom:8px;">📚 {data_line}</div>
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;text-align:center;">
+        <div style="background:#0f172a;padding:7px;border-radius:8px;border:1px solid #1e293b;"><div style="font-size:10px;color:#94a3b8;">QADAM</div><div style="font-size:15px;font-weight:700;">#{step:,}/{total:,}</div></div>
+        <div style="background:#0f172a;padding:7px;border-radius:8px;border:1px solid #1e293b;"><div style="font-size:10px;color:#94a3b8;">TOTAL</div><div style="font-size:15px;font-weight:700;color:#38bdf8;">{tl:.4f}</div></div>
+        <div style="background:#0f172a;padding:7px;border-radius:8px;border:1px solid #1e293b;"><div style="font-size:10px;color:#94a3b8;">FLOW+PRIOR</div><div style="font-size:15px;font-weight:700;color:#a855f7;">{fl:.4f}</div></div>
+        <div style="background:#0f172a;padding:7px;border-radius:8px;border:1px solid #1e293b;"><div style="font-size:10px;color:#94a3b8;">DUR</div><div style="font-size:15px;font-weight:700;color:#4ade80;">{dl:.4f}</div></div>
+        <div style="background:#0f172a;padding:7px;border-radius:8px;border:1px solid #1e293b;"><div style="font-size:10px;color:#94a3b8;">ENERGY</div><div style="font-size:15px;font-weight:700;color:#f59e0b;">{el:.4f}</div></div>
+        </div></div>"""
+        update_display(HTML(html), display_id=self.hid)
+
+    def update_media_rows(self, step, rows):
+        self._init()
+        cards = []
+        for row in rows:
+            badge, ptxt, dur, spc, wb = row[:5]
+            note = row[5] if len(row) > 5 else ""
+            nh = f'<div style="margin-top:4px;font-size:11px;color:#94a3b8;">{note}</div>' if note else ""
+            cards.append(f"""<div style="display:grid;grid-template-columns:1.55fr 1fr;gap:14px;background:#0f172a;padding:10px 14px;border-radius:10px;border:1px solid #1e293b;margin-bottom:8px;align-items:center;">
+            <div><img src="data:image/png;base64,{spc}" style="width:100%;height:auto;border-radius:6px;border:1px solid #334155;display:block;"/></div>
+            <div style="display:flex;flex-direction:column;justify-content:space-between;gap:8px;">
+            <div><span style="background:#1e293b;color:#38bdf8;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;">{badge} ({dur:.2f}s)</span>
+            {nh}<div style="margin-top:6px;font-size:12.5px;color:#e2e8f0;line-height:1.45;">"{ptxt}"</div></div>
+            <audio controls preload="none" style="width:100%;height:34px;" src="data:audio/wav;base64,{wb}"></audio></div></div>""")
+        full = f"""<div style="background:#090d16;padding:12px;border-radius:12px;border:1px solid #1e293b;font-family:'Segoe UI',sans-serif;">
+        <div style="font-size:13px;font-weight:700;color:#38bdf8;margin-bottom:8px;">🎧 STUDIO — QADAM #{step:,}</div>
+        {''.join(cards)}</div>"""
+        update_display(HTML(full), display_id=self.mid)
+
+STUDIO_UI = StudioUI()
+HF_API = HfApi(token=HF_TOKEN) if HF_TOKEN else None
+if HF_API:
+    try:
+        HF_API.create_repo(repo_id=HF_PRIVATE_CKPT_REPO, repo_type="model", private=True, exist_ok=True)
+    except Exception:
+        pass
+
+MODEL = None
+OPT = None
+SCHED = None
+BEST_LOSS = 999.0
+CURRENT_STEP = 0
+RESUMED_STEP = 0
+HF_STATUS_STR = "Tayyor"
+
+def evaluate_and_archive_samples(step, upload=False):
+    global HF_STATUS_STR
+    raw = MODEL.module if isinstance(MODEL, nn.DataParallel) else MODEL
+    was_training = raw.training
+    raw.eval()
+    rows = []
+    ref_d = len(REF_WAV_NP) / CFG.sample_rate
+    rows.append((
+        "0. ETALON", REF_TEXT, ref_d,
+        render_wide_mel_png(REF_MEL_NORM, "ETALON 24kHz", ref_d),
+        wav_to_b64(REF_WAV_NP)
+    ))
+    td = WORK_DIR / f"temp_samples_step_{step:06d}"
+    td.mkdir(parents=True, exist_ok=True)
+
+    for idx, (label, prompt) in enumerate(EVAL_PROMPTS, 1):
+        try:
+            gw, gm, info = synthesize_long(raw, prompt, REF_MEL_NORM, **SYNTH_DEFAULTS)
+            gw_clean = postprocess_wav(gw, CFG.sample_rate)
+            if PROSODY_ENABLED:
+                gw_pr = transfer_prosody(
+                    gw_clean, REF_WAV_NP, sr=CFG.sample_rate,
+                    strength=PROSODY_STRENGTH, mode=PROSODY_MODE
+                )
+                gw = gw_pr if _q_score(gw_pr) >= _q_score(gw_clean) - 1.0 else gw_clean
+            else:
+                gw = gw_clean
+        except Exception as e:
+            print(f"⚠️ Eval {label}: {e}")
+            continue
+        dur = len(gw) / CFG.sample_rate
+        sb = render_wide_mel_png(gm, f"{label} (Step #{step})", dur)
+        wb = wav_to_b64(gw)
+        note = f"{info['n_chunks']} bo'lak | {info['cps_min']:.1f}–{info['cps_max']:.1f} cps | q={_q_score(gw):.1f}"
+        rows.append((label, prompt, dur, sb, wb, note))
+        try:
+            wav_p = td / f"sample_{idx}_{step:06d}.wav"
+            png_p = td / f"spec_{idx}_{step:06d}.png"
+            sf.write(str(wav_p), gw, CFG.sample_rate)
+            save_audio_png(gw, gm, png_p, title=f"Step #{step} · {label}", ref_mel=REF_MEL_NORM)
+            if SHOW_IMAGES and idx == 1:
+                show_png(png_p, width=IMAGE_WIDTH)
+        except Exception:
+            pass
+
+    STUDIO_UI.update_media_rows(step, rows)
+    if LOSS_HISTORY["step"]:
+        cp = save_curve_png(LOSS_HISTORY, td / f"curve_{step:06d}.png", title=f"OQIM-KOKORO {CODE_VERSION} · Step #{step}")
+        if SHOW_IMAGES and upload and cp is not None:
+            show_png(cp, width=IMAGE_WIDTH)
+
+    if upload and HF_API:
+        try:
+            HF_API.upload_folder(
+                folder_path=str(td), path_in_repo=get_hf_sample_shard_path(step),
+                repo_id=HF_PRIVATE_CKPT_REPO, repo_type="model",
+                commit_message=f"Samples step {step}"
+            )
+            HF_STATUS_STR = f"Samples #{step} ✅"
+        except Exception as e:
+            HF_STATUS_STR = f"Sample xato: {str(e)[:18]}"
+    shutil.rmtree(td, ignore_errors=True)
+    if was_training:
+        raw.train()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+# ==============================================================================
+# 12. CHECKPOINT SAVE & SAFE RESUME (362 TENSORS)
+# ==============================================================================
+def save_checkpoint_sync(step, is_best=False):
+    global HF_STATUS_STR, RESUMED_STEP
+    DATA_STATE.write_local()
+    if step <= 0 or step <= RESUMED_STEP:
+        return
+    raw = MODEL.module if isinstance(MODEL, nn.DataParallel) else MODEL
+    sd = raw.state_dict()
+    payload = {
+        "step": int(step),
+        "best_loss": float(BEST_LOSS),
+        "arch_version": ARCH_VERSION,
+        "model": sd,
+        "opt": OPT.state_dict() if OPT else None,
+        "sched": SCHED.state_dict() if SCHED else None,
+        "data_state": DATA_STATE.snapshot() if DATA_STATE.n > 0 else None,
+    }
+    latest = CKPT_DIR / "latest_checkpoint.pt"
+    torch.save(payload, latest)
+    shutil.copy2(latest, CKPT_DIR / f"ckpt_step_{step:06d}.pt")
+    for ob in sorted(CKPT_DIR.glob("ckpt_step_*.pt"))[:-2]:
+        try:
+            ob.unlink()
+        except Exception:
+            pass
+    best_p = CKPT_DIR / "best_model.pt"
+    if is_best or not best_p.exists():
+        shutil.copy2(latest, best_p)
+        is_best = True
+
+    manifest = {
+        "arch_version": ARCH_VERSION,
+        "code_version": CODE_VERSION,
+        "n_tensors": len(sd),
+        "step": int(step),
+        "best_loss": float(BEST_LOSS),
+    }
+    manifest_p = CKPT_DIR / "arch_manifest.json"
+    manifest_p.write_text(json.dumps(manifest, indent=2))
+
+    if HF_API:
+        try:
+            HF_STATUS_STR = f"HF #{step}..."
+            HF_API.upload_file(
+                path_or_fileobj=str(manifest_p), path_in_repo="arch_manifest.json",
+                repo_id=HF_PRIVATE_CKPT_REPO, repo_type="model",
+                commit_message=f"Manifest #{step}"
+            )
+            HF_API.upload_file(
+                path_or_fileobj=str(latest), path_in_repo="latest_checkpoint.pt",
+                repo_id=HF_PRIVATE_CKPT_REPO, repo_type="model",
+                commit_message=f"Step {step}"
+            )
+            if is_best:
+                HF_API.upload_file(
+                    path_or_fileobj=str(best_p), path_in_repo="best_model.pt",
+                    repo_id=HF_PRIVATE_CKPT_REPO, repo_type="model",
+                    commit_message=f"Best #{step}"
+                )
+            HF_STATUS_STR = f"HF ✅ #{step}"
+        except Exception as e:
+            HF_STATUS_STR = f"HF xato: {str(e)[:18]}"
+
+def try_resume(raw_model, opt, sched):
+    global BEST_LOSS, RESUMED_STEP, RESUMED_DATA_STATE
+    RESUMED_DATA_STATE = None
+    if FRESH_START:
+        print("ℹ️ OQIM_FRESH=1 → 0 dan boshlanadi")
+        RESUMED_STEP = 0
+        BEST_LOSS = 999.0
+        return 0
+
+    cs = []
+    for f in ["best_model.pt", "latest_checkpoint.pt"]:
+        p = CKPT_DIR / f
+        if p.exists():
+            cs.append((f"L {f}", p))
+    for p in sorted(CKPT_DIR.glob("ckpt_step_*.pt"), reverse=True):
+        cs.append((f"L {p.name}", p))
+
+    if HF_TOKEN:
+        hcd = CKPT_DIR / "hf_sync"
+        hcd.mkdir(parents=True, exist_ok=True)
+        for f in ["best_model.pt", "latest_checkpoint.pt"]:
+            try:
+                p = hf_hub_download(
+                    repo_id=HF_PRIVATE_CKPT_REPO, filename=f, repo_type="model",
+                    token=HF_TOKEN, local_dir=str(hcd)
+                )
+                cs.append((f"HF {f}", Path(p)))
+            except Exception:
+                pass
+
+    msd = raw_model.state_dict()
+    val = []
+    seen = set()
+    for lbl, p in cs:
+        if p is None or not p.exists():
+            continue
+        rp = str(p.resolve())
+        if rp in seen:
+            continue
+        seen.add(rp)
+        try:
+            ck = torch.load(p, map_location="cpu", weights_only=False)
+            arc = ck.get("arch_version", "")
+            sd = ck.get("model", ck)
+            mt = {k: v for k, v in sd.items() if k in msd and msd[k].shape == v.shape}
+            step = int(ck.get("step", 0))
+            bl = float(ck.get("best_loss", 999.0))
+            if bl <= 0.5001 and step == 0:
+                bl = 999.0
+            print(f"🔎 [{lbl}]: #{step:,} | {arc} | {len(mt)}/{len(msd)} tensor")
+            if len(mt) == len(msd) and arc == ARCH_VERSION and step > 0:
+                val.append((step, len(mt), -bl, lbl, p, ck, mt))
+        except Exception as e:
+            print(f"⚠️ [{lbl}] {e}")
+
+    if not val:
+        print("ℹ️ Mos checkpoint topilmadi → #1 dan boshlanadi")
+        RESUMED_STEP = 0
+        BEST_LOSS = 999.0
+        return 0
+
+    val.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    bs, nm, _, lbl_best, _, bk, mt = val[0]
+    msd.update(mt)
+    raw_model.load_state_dict(msd, strict=True)
+    if opt and bk.get("opt"):
+        try:
+            opt.load_state_dict(bk["opt"])
+        except Exception:
+            pass
+    if sched and bk.get("sched"):
+        try:
+            sched.load_state_dict(bk["sched"])
+        except Exception:
+            pass
+    ds = bk.get("data_state")
+    RESUMED_DATA_STATE = ds if isinstance(ds, dict) else None
+    BEST_LOSS = float(bk.get("best_loss", 999.0))
+    if BEST_LOSS <= 0.5001:
+        BEST_LOSS = 999.0
+    RESUMED_STEP = int(bs)
+    print(f"✅ RESUME [{lbl_best}] #{bs + 1:,} ({nm}/{len(msd)} tensor | best={BEST_LOSS:.4f})")
+    if RESUMED_DATA_STATE:
+        print(f"   📚 Data pos: {int(RESUMED_DATA_STATE.get('consumed', 0)):,}")
+    return bs
+
+# ==============================================================================
+# 13. BUILT-IN PRE-FLIGHT VERIFIER & VOICE-CLONE AUDIT
+# ==============================================================================
+def preflight_verify(model):
+    """Train boshlanishidan oldin 5 ta kritik nuqtani tekshiradi."""
+    raw = model.module if isinstance(model, nn.DataParallel) else model
+    was_tr = raw.training
+    raw.train()
+    dev = next(raw.parameters()).device
+    B = max(1, NUM_GPUS) * 2
+    t = torch.ones((B, 20), dtype=torch.long, device=dev)
+    tl = torch.full((B,), 20, dtype=torch.long, device=dev)
+    m = torch.randn((B, 96, CFG.n_mels), dtype=torch.float32, device=dev)
+    ml = torch.full((B,), 96, dtype=torch.long, device=dev)
+    s = torch.zeros(B, dtype=torch.long, device=dev)
+
+    raw.zero_grad(set_to_none=True)
+    with _autocast(USE_SCALER, AMP_DTYPE):
+        fm, pr, du, en = model(t, tl, m, ml, s)
+        loss = fm.mean() + 1.25 * pr.mean() + 0.45 * du.mean() + 0.45 * en.mean()
+    loss.backward()
+    g_spk = sum(float(p.grad.abs().sum()) for p in raw.spk_enc.parameters() if p.grad is not None)
+    raw.zero_grad(set_to_none=True)
+    raw.eval()
+
+    w_test = speak(
+        "Assalomu alaykum, bu tezkor tizim sinovi.",
+        out_path=str(WORK_DIR / "selftest.wav"),
+        model=raw, steps=12, show=SHOW_IMAGES,
+        png_path=str(WORK_DIR / "selftest.png")
+    )
+    dur = len(w_test) / CFG.sample_rate
+    pk = float(np.max(np.abs(w_test)))
+    if was_tr:
+        raw.train()
+    assert g_spk > 0, "spk_enc gradient = 0!"
+    assert dur > 0.35 and pk > 0.25, f"Sintez noto'g'ri: dur={dur:.2f}s pk={pk:.3f}"
+    print(f"⚡ [PRE-FLIGHT OK] tensors={len(raw.state_dict())} | spk_enc_grad={g_spk:.2e} | selftest={dur:.2f}s peak={pk:.3f}")
+
+# ==============================================================================
+# 14. MAIN TRAINING LOOP (CONSOLE 1K, EVAL 500, HF SAVE 2K)
+# ==============================================================================
+def train_main():
+    global MODEL, OPT, SCHED, BEST_LOSS, CURRENT_STEP, RESUMED_STEP
+    shards = ensure_dataset_shards()
+    ds = UzbekZeroCopyShardDataset(shards)
+    verify_dataset_before_training(ds)
+    dataset_quality_report(ds, n=180)
+
+    eff_b = CFG.batch_per_gpu * max(1, NUM_GPUS)
+    raw_model = OqimKokoroV7().to(DEVICE)
+    n_params = sum(p.numel() for p in raw_model.parameters()) / 1e6
+    n_tensors = len(raw_model.state_dict())
+    print(f"[model] OqimKokoroV7 | params={n_params:.2f}M | tensors={n_tensors} (362 mos)")
+
+    OPT = torch.optim.AdamW(
+        raw_model.parameters(), lr=CFG.lr, betas=(0.9, 0.98), weight_decay=CFG.weight_decay
+    )
+
+    def lr_lambda(step):
+        if step < CFG.warmup_steps:
+            return float(step + 1) / float(max(1, CFG.warmup_steps))
+        pg = float(step - CFG.warmup_steps) / float(max(1, CFG.total_steps - CFG.warmup_steps))
+        return max(CFG.min_lr / CFG.lr, 0.5 * (1.0 + math.cos(math.pi * min(1.0, pg))))
+
+    SCHED = torch.optim.lr_scheduler.LambdaLR(OPT, lr_lambda)
+    start = try_resume(raw_model, OPT, SCHED)
+    CURRENT_STEP = start
+
+    saved = RESUMED_DATA_STATE if RESUMED_DATA_STATE is not None else DataOrderState.read_local()
+    sps = eff_b * CFG.grad_accum
+    legacy = start * sps / float(ds.total_rows)
+    bar = auto_block_rows(ds)
+    DATA_STATE.configure(ds.total_rows, ds.sig, bar, saved, legacy, len(ds.shard_paths))
+
+    print("=" * 78)
+    print(f"[DATA v{DATA_ORDER_VERSION}] N={ds.total_rows:,} | shard={len(ds.shard_paths)} | "
+          f"batch={eff_b}x{CFG.grad_accum}={sps}/step | blok={DATA_STATE.block_rows}")
+    print(f"[DATA] {DATA_STATE.origin} | seed={DATA_STATE.seed} | epoch {DATA_STATE.consumed / ds.total_rows:.3f}")
+    if start > 0:
+        uq = 100.0 * (1.0 - math.exp(-legacy))
+        print(f"[EPOCH] {start*sps:,} namuna | N={ds.total_rows:,} | ≈{legacy:.2f}ee (unikal ≈{uq:.0f}%)")
+    verify_data_order(ds, DATA_STATE)
+    DATA_STATE.write_local()
+    print("=" * 78)
+    print(f"[SCHEDULE] Console: har {CFG.console_every_steps} | Eval: har {CFG.eval_every_steps} | HF Save: har {CFG.save_every_steps}")
+    print("=" * 78)
+
+    sampler = ResumableBlockSampler(ds, DATA_STATE)
+    loader = DataLoader(
+        ds, batch_size=eff_b, sampler=sampler, num_workers=2,
+        worker_init_fn=_worker_init, prefetch_factor=2,
+        persistent_workers=True, pin_memory=True, drop_last=True,
+        collate_fn=collate_tts_batch
+    )
+
+    MODEL = nn.DataParallel(raw_model) if NUM_GPUS > 1 else raw_model
+    preflight_verify(MODEL)
+
+    scaler = _make_scaler(USE_SCALER)
+    STUDIO_UI._init()
+    MODEL.train()
+    OPT.zero_grad(set_to_none=True)
+
+    t0 = time.time()
+    ema_t = ema_f = ema_d = ema_e = None
+    accum = 0
+    step = start
+    consec_err = 0
+
+    while step < CFG.total_steps:
+        for tp, tl, wp, wl, si in loader:
+            DATA_STATE.consumed += int(tp.size(0))
+            tp = tp.to(DEVICE, non_blocking=True)
+            tl = tl.to(DEVICE, non_blocking=True)
+            wp = wp.to(DEVICE, non_blocking=True)
+            wl = wl.to(DEVICE, non_blocking=True)
+            si = si.to(DEVICE, non_blocking=True)
+
+            with torch.no_grad():
+                lm = MEL_EXTRACTOR(wp)
+                mn = MEL_EXTRACTOR.normalize(lm).transpose(1, 2).contiguous()
+                ml_ = torch.clamp(wl // CFG.hop_size, min=1, max=mn.size(1))
+
+            try:
+                with _autocast(USE_SCALER, AMP_DTYPE):
+                    fm, pr, du, en = MODEL(tp, tl, mn, ml_, si)
+                    fm, pr, du, en = fm.mean(), pr.mean(), du.mean(), en.mean()
+                    tot = fm + 1.25 * pr + 0.45 * du + 0.45 * en
+                    sc = tot / CFG.grad_accum
+
+                if not torch.isfinite(tot):
+                    OPT.zero_grad(set_to_none=True)
+                    accum = 0
+                    continue
+
+                scaler.scale(sc).backward()
+                accum += 1
+                consec_err = 0
+
+                if accum >= CFG.grad_accum:
+                    scaler.unscale_(OPT)
+                    gn = torch.nn.utils.clip_grad_norm_(MODEL.parameters(), max_norm=1.0)
+                    if torch.isfinite(gn):
+                        scaler.step(OPT)
+                        SCHED.step()
+                    scaler.update()
+                    OPT.zero_grad(set_to_none=True)
+                    accum = 0
+                    step += 1
+                    CURRENT_STEP = step
+
+                    vt, vf, vd, ve = float(tot), float(fm + pr), float(du), float(en)
+                    if ema_t is None:
+                        ema_t, ema_f, ema_d, ema_e = vt, vf, vd, ve
+                    else:
+                        ema_t = 0.92 * ema_t + 0.08 * vt
+                        ema_f = 0.92 * ema_f + 0.08 * vf
+                        ema_d = 0.92 * ema_d + 0.08 * vd
+                        ema_e = 0.92 * ema_e + 0.08 * ve
+
+                    if step % 5 == 0 or step == start + 1:
+                        el = max(time.time() - t0, 1e-3)
+                        sp = (step - start) / el
+                        STUDIO_UI.update_metrics(
+                            step, CFG.total_steps, ema_t, ema_f, ema_d, ema_e,
+                            SCHED.get_last_lr()[0], sp, HF_STATUS_STR, DATA_STATE.ui_line(ds)
+                        )
+
+                    # ⭐ CONSOLE HISOBOT har 1000 qadamda
+                    if step % CFG.console_every_steps == 0:
+                        now = time.strftime("%H:%M:%S")
+                        el = max(time.time() - t0, 1e-3)
+                        sp = (step - start) / el
+                        LOSS_HISTORY["step"].append(step)
+                        LOSS_HISTORY["tot"].append(ema_t)
+                        LOSS_HISTORY["flow"].append(ema_f)
+                        LOSS_HISTORY["dur"].append(ema_d)
+                        LOSS_HISTORY["en"].append(ema_e)
+                        print(
+                            f"[{now}] #{step:,}/{CFG.total_steps:,} | tot={ema_t:.4f} | flow={ema_f:.4f} "
+                            f"| dur={ema_d:.4f} | en={ema_e:.4f} | lr={SCHED.get_last_lr()[0]:.2e} "
+                            f"| {sp:.2f} st/s | {DATA_STATE.ui_line(ds)}",
+                            flush=True
+                        )
+
+                    if step % 100 == 0:
+                        DATA_STATE.write_local()
+
+                    # ⭐ EVAL (Studio + Console PNG) har 500 qadamda
+                    if step == start + 10 or step % CFG.eval_every_steps == 0:
+                        do_upload = (step % CFG.save_every_steps == 0)
+                        evaluate_and_archive_samples(step, upload=do_upload)
+
+                    # ⭐ HF + LOCAL CHECKPOINT SAVE har 2000 qadamda
+                    if step % CFG.save_every_steps == 0 and step > start:
+                        isb = ema_t < BEST_LOSS
+                        if isb:
+                            BEST_LOSS = ema_t
+                        save_checkpoint_sync(step, is_best=isb)
+                        print(f"💾 [SAVE #{step:,}] HF + Local checkpoint saqlandi | best={BEST_LOSS:.4f}", flush=True)
+
+                    if step >= CFG.total_steps:
+                        break
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    print("⚠️ OOM — batch skip")
+                    OPT.zero_grad(set_to_none=True)
+                    accum = 0
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                consec_err += 1
+                print(f"⚠️ Step {step} xato ({consec_err}/5): {e}")
+                traceback.print_exc(limit=4)
+                OPT.zero_grad(set_to_none=True)
+                accum = 0
+                if consec_err >= 5:
+                    raise
+        if step >= CFG.total_steps:
+            break
+
+if __name__ == "__main__" and OQIM_MODE == "train":
+    try:
+        train_main()
+    except KeyboardInterrupt:
+        if CURRENT_STEP > RESUMED_STEP and CURRENT_STEP > 0:
+            print(f"\n🛑 To'xtatildi! #{CURRENT_STEP:,} saqlanmoqda...")
+            save_checkpoint_sync(CURRENT_STEP)
+            print(f"✅ #{CURRENT_STEP:,} saqlandi.")
+        else:
+            DATA_STATE.write_local()
+            print(f"\n🛑 To'xtatildi (#{RESUMED_STEP:,})")
